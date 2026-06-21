@@ -50,9 +50,9 @@ func TestNewLogInitialSizeExistingFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.log")
 
-	// Pre-create a file with known contents.
-	initialData := []byte("hello world")
-	if err := os.WriteFile(path, initialData, 0644); err != nil {
+	// Write a properly encoded record directly to the file.
+	record := Encode([]byte("hello world"))
+	if err := os.WriteFile(path, record, 0644); err != nil {
 		t.Fatalf("write initial file: %v", err)
 	}
 
@@ -62,8 +62,9 @@ func TestNewLogInitialSizeExistingFile(t *testing.T) {
 	}
 	defer l.Close()
 
-	if l.size != int64(len(initialData)) {
-		t.Fatalf("initial size: got %d, want %d", l.size, len(initialData))
+	expectedSize := int64(len(record))
+	if l.size != expectedSize {
+		t.Fatalf("initial size: got %d, want %d", l.size, expectedSize)
 	}
 }
 
