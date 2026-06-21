@@ -300,14 +300,10 @@ func TestReadDetectsCorruption(t *testing.T) {
 		t.Fatalf("NewLog failed: %v", err)
 	}
 
-	_, err = l.Append([]byte("important data"))
-	if err != nil {
-		t.Fatalf("Append failed: %v", err)
-	}
-
+	l.Append([]byte("important data"))
 	l.Close()
 
-	// Corrupt the file: flip a byte in the data section.
+	// Corrupt the data section.
 	raw, err := os.OpenFile(path, os.O_RDWR, 0644)
 	if err != nil {
 		t.Fatalf("open raw file: %v", err)
@@ -319,22 +315,17 @@ func TestReadDetectsCorruption(t *testing.T) {
 	raw.WriteAt(oneByte, corruptPos)
 	raw.Close()
 
-	// Reopen and try to read.
+	// Reopen. buildIndex should find zero valid records.
 	l2, err := NewLog(path)
 	if err != nil {
 		t.Fatalf("NewLog after corruption: %v", err)
 	}
 	defer l2.Close()
 
-	// Manually rebuild the index (crash recovery will automate this in Week 2).
-	l2.index = append(l2.index, 0)
-
 	_, err = l2.Read(0)
 	if err == nil {
-		t.Fatal("expected checksum error, got nil")
+		t.Fatal("expected error reading corrupted record, got nil")
 	}
-
-	t.Logf("Got expected error: %v", err)
 }
 
 func TestReadLargeRecord(t *testing.T) {
@@ -361,5 +352,179 @@ func TestReadLargeRecord(t *testing.T) {
 
 	if !bytes.Equal(got, want) {
 		t.Errorf("large record: got %d bytes, want %d bytes", len(got), len(want))
+	}
+}
+
+func TestReopenAndReadBack(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	// Open, write some records, close.
+	l, err := NewLog(path)
+	if err != nil {
+		t.Fatalf("NewLog failed: %v", err)
+	}
+
+	records := []string{"alpha", "bravo", "charlie"}
+	for _, s := range records {
+		if _, err := l.Append([]byte(s)); err != nil {
+			t.Fatalf("Append(%q) failed: %v", s, err)
+		}
+	}
+
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Reopen the same file.
+	l2, err := NewLog(path)
+	if err != nil {
+		t.Fatalf("NewLog reopen failed: %v", err)
+	}
+	defer l2.Close()
+
+	// All records should be readable without manually setting up the index.
+	for i, s := range records {
+		got, err := l2.Read(uint64(i))
+		if err != nil {
+			t.Fatalf("Read(%d) after reopen failed: %v", i, err)
+		}
+		if string(got) != s {
+			t.Errorf("Read(%d) after reopen: got %q, want %q", i, got, s)
+		}
+	}
+}
+
+func TestReopenAndAppendMore(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	// First session: write 2 records.
+	l, err := NewLog(path)
+	if err != nil {
+		t.Fatalf("NewLog failed: %v", err)
+	}
+
+	l.Append([]byte("first"))
+	l.Append([]byte("second"))
+	l.Close()
+
+	// Second session: reopen, write 2 more.
+	l2, err := NewLog(path)
+	if err != nil {
+		t.Fatalf("NewLog reopen failed: %v", err)
+	}
+
+	l2.Append([]byte("third"))
+	l2.Append([]byte("fourth"))
+	l2.Close()
+
+	// Third session: reopen, verify all 4.
+	l3, err := NewLog(path)
+	if err != nil {
+		t.Fatalf("NewLog final reopen failed: %v", err)
+	}
+	defer l3.Close()
+
+	expected := []string{"first", "second", "third", "fourth"}
+	for i, s := range expected {
+		got, err := l3.Read(uint64(i))
+		if err != nil {
+			t.Fatalf("Read(%d) failed: %v", i, err)
+		}
+		if string(got) != s {
+			t.Errorf("Read(%d): got %q, want %q", i, got, s)
+		}
+	}
+}
+
+func TestReopenEmptyFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	// Create and close an empty log.
+	l, err := NewLog(path)
+	if err != nil {
+		t.Fatalf("NewLog failed: %v", err)
+	}
+	l.Close()
+
+	// Reopen. Should have zero records.
+	l2, err := NewLog(path)
+	if err != nil {
+		t.Fatalf("NewLog reopen failed: %v", err)
+	}
+	defer l2.Close()
+
+	if l2.Size() != 0 {
+		t.Errorf("size after reopen empty: got %d, want 0", l2.Size())
+	}
+
+	_, err = l2.Read(0)
+	if err == nil {
+		t.Fatal("expected error reading from empty reopened log")
+	}
+}
+
+func TestReopenDetectsCorruption(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	// Write 3 records.
+	l, err := NewLog(path)
+	if err != nil {
+		t.Fatalf("NewLog failed: %v", err)
+	}
+
+	l.Append([]byte("good record one"))
+	l.Append([]byte("good record two"))
+	l.Append([]byte("this will be corrupted"))
+	l.Close()
+
+	// Corrupt the last record: flip a byte in its data section.
+	// First, we need to know where the last record starts.
+	// Record 0: headerSize + 15 = 27 bytes, starts at 0
+	// Record 1: headerSize + 15 = 27 bytes, starts at 27
+	// Record 2: headerSize + 22 = 34 bytes, starts at 54
+	// Corrupt a byte in record 2's data: byte 54 + headerSize + 2 = byte 68
+	raw, err := os.OpenFile(path, os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("open raw file: %v", err)
+	}
+	corruptPos := int64(54 + headerSize + 2)
+	oneByte := make([]byte, 1)
+	raw.ReadAt(oneByte, corruptPos)
+	oneByte[0] ^= 0xFF
+	raw.WriteAt(oneByte, corruptPos)
+	raw.Close()
+
+	// Reopen. buildIndex should find records 0 and 1, stop at corrupted record 2.
+	l2, err := NewLog(path)
+	if err != nil {
+		t.Fatalf("NewLog after corruption failed: %v", err)
+	}
+	defer l2.Close()
+
+	// Records 0 and 1 should be readable.
+	got, err := l2.Read(0)
+	if err != nil {
+		t.Fatalf("Read(0) failed: %v", err)
+	}
+	if string(got) != "good record one" {
+		t.Errorf("Read(0): got %q, want %q", got, "good record one")
+	}
+
+	got, err = l2.Read(1)
+	if err != nil {
+		t.Fatalf("Read(1) failed: %v", err)
+	}
+	if string(got) != "good record two" {
+		t.Errorf("Read(1): got %q, want %q", got, "good record two")
+	}
+
+	// Record 2 should not exist in the index.
+	_, err = l2.Read(2)
+	if err == nil {
+		t.Fatal("expected error reading corrupted record 2, got nil")
 	}
 }

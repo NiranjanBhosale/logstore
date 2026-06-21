@@ -2,7 +2,9 @@ package log
 
 import (
 	"bufio"
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"sync"
@@ -19,6 +21,7 @@ type Log struct {
 	index []int64
 
 	// size tracks how many bytes are currently stored in the file.
+	// This can also be called as the last byte tracked
 	size int64
 }
 
@@ -29,17 +32,21 @@ func NewLog(path string) (*Log, error) {
 		return nil, fmt.Errorf("open log file %q: %w", path, err)
 	}
 
-	info, err := file.Stat()
-	if err != nil {
-		file.Close()
-		return nil, fmt.Errorf("stat log file %q: %w", path, err)
-	}
-
 	l := &Log{
 		file:   file,
 		writer: bufio.NewWriter(file),
 		index:  make([]int64, 0),
-		size:   info.Size(),
+	}
+
+	if err := l.buildIndex(); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("build index for %q: %w", path, err)
+	}
+
+	// Seek to the end so the bufio.Writer appends after existing data.
+	if _, err := l.file.Seek(l.size, io.SeekStart); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("seek to end: %w", err)
 	}
 
 	return l, nil
@@ -137,4 +144,52 @@ func (l *Log) Read(offset uint64) ([]byte, error) {
 	// Decode handles header parsing, checksum validation, everything.
 	return Decode(record)
 
+}
+
+func (l *Log) buildIndex() error {
+	if _, err := l.file.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek to start: %w", err)
+	}
+
+	var pos int64
+
+	for {
+
+		header := make([]byte, headerSize)
+		_, err := io.ReadFull(l.file, header)
+
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break
+		}
+
+		if err != nil {
+			return fmt.Errorf("read header at byte %d: %w", pos, err)
+		}
+
+		dataLen := binary.BigEndian.Uint64(header[0:lenSize])
+		data := make([]byte, dataLen)
+
+		_, err = io.ReadFull(l.file, data)
+
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break
+		}
+
+		if err != nil {
+			return fmt.Errorf("read data at byte %d: %w", pos, err)
+		}
+
+		storedChecksum := binary.BigEndian.Uint32(header[lenSize:headerSize])
+		newChecksum := crc32.ChecksumIEEE(data)
+
+		if storedChecksum != newChecksum {
+			break
+		}
+
+		l.index = append(l.index, pos)
+		pos += int64(headerSize + dataLen)
+	}
+
+	l.size = pos
+	return nil
 }
