@@ -1,5 +1,5 @@
 # Compiled binary
-logstore
+logstore_exe
 
 # Test binary, built with go test -c
 *.test
@@ -16,5 +16,3 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
-
-data/

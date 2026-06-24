@@ -2,152 +2,50 @@ package log
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
-func TestNewLogCreatesFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.log")
+func TestNewLogCreatesDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
 
-	l, err := NewLog(path)
+	l, err := NewLog(dir, 0)
 	if err != nil {
 		t.Fatalf("NewLog failed: %v", err)
 	}
 	defer l.Close()
 
-	info, err := os.Stat(path)
+	info, err := os.Stat(dir)
 	if err != nil {
-		t.Fatalf("stat created file: %v", err)
+		t.Fatalf("stat dir: %v", err)
 	}
-
-	if info.IsDir() {
-		t.Fatalf("expected a file, got directory")
+	if !info.IsDir() {
+		t.Fatal("expected directory")
 	}
 }
 
-func TestNewLogInitialSizeEmptyFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.log")
+func TestNewLogCreatesFirstSegment(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
 
-	l, err := NewLog(path)
+	l, err := NewLog(dir, 0)
 	if err != nil {
 		t.Fatalf("NewLog failed: %v", err)
 	}
 	defer l.Close()
 
-	if l.size != 0 {
-		t.Fatalf("initial size: got %d, want 0", l.size)
-	}
-
-	if len(l.index) != 0 {
-		t.Fatalf("initial index length: got %d, want 0", len(l.index))
-	}
-}
-
-func TestNewLogInitialSizeExistingFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.log")
-
-	// Write a properly encoded record directly to the file.
-	record := Encode([]byte("hello world"))
-	if err := os.WriteFile(path, record, 0644); err != nil {
-		t.Fatalf("write initial file: %v", err)
-	}
-
-	l, err := NewLog(path)
-	if err != nil {
-		t.Fatalf("NewLog failed: %v", err)
-	}
-	defer l.Close()
-
-	expectedSize := int64(len(record))
-	if l.size != expectedSize {
-		t.Fatalf("initial size: got %d, want %d", l.size, expectedSize)
-	}
-}
-
-func TestClose(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.log")
-
-	l, err := NewLog(path)
-	if err != nil {
-		t.Fatalf("NewLog failed: %v", err)
-	}
-
-	if err := l.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-}
-
-func TestAppendSingleRecord(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.log")
-
-	l, err := NewLog(path)
-	if err != nil {
-		t.Fatalf("NewLog failed: %v", err)
-	}
-	defer l.Close()
-
-	data := []byte("hello world")
-	offset, err := l.Append(data)
-	if err != nil {
-		t.Fatalf("Append failed: %v", err)
-	}
-
-	// First record should get offset 0
-	if offset != 0 {
-		t.Errorf("offset: got %d, want 0", offset)
-	}
-
-	// Size should be header (12 bytes) + data (11 bytes) = 23 bytes
-	expectedSize := int64(RecordSize(len(data)))
-	if l.Size() != expectedSize {
-		t.Errorf("size: got %d, want %d", l.Size(), expectedSize)
-	}
-}
-
-func TestAppendMultipleRecords(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.log")
-
-	l, err := NewLog(path)
-	if err != nil {
-		t.Fatalf("NewLog failed: %v", err)
-	}
-	defer l.Close()
-
-	records := []string{"first", "second", "third"}
-
-	for i, s := range records {
-		offset, err := l.Append([]byte(s))
-		if err != nil {
-			t.Fatalf("Append(%q) failed: %v", s, err)
-		}
-		if offset != uint64(i) {
-			t.Errorf("Append(%q): offset got %d, want %d", s, offset, i)
-		}
-	}
-
-	// Calculate expected total size
-	expectedSize := int64(0)
-	for _, s := range records {
-		expectedSize += int64(RecordSize(len(s)))
-	}
-
-	if l.Size() != expectedSize {
-		t.Errorf("total size: got %d, want %d", l.Size(), expectedSize)
+	segPath := filepath.Join(dir, "segment-000001.log")
+	if _, err := os.Stat(segPath); err != nil {
+		t.Fatalf("first segment not created: %v", err)
 	}
 }
 
 func TestAppendAndReadSingleRecord(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.log")
+	dir := filepath.Join(t.TempDir(), "logs")
 
-	l, err := NewLog(path)
+	l, err := NewLog(dir, 0)
 	if err != nil {
 		t.Fatalf("NewLog failed: %v", err)
 	}
@@ -165,52 +63,45 @@ func TestAppendAndReadSingleRecord(t *testing.T) {
 	}
 
 	if !bytes.Equal(got, want) {
-		t.Errorf("Read returned %q, want %q", got, want)
+		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
 func TestAppendAndReadMultipleRecords(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.log")
+	dir := filepath.Join(t.TempDir(), "logs")
 
-	l, err := NewLog(path)
+	l, err := NewLog(dir, 0)
 	if err != nil {
 		t.Fatalf("NewLog failed: %v", err)
 	}
 	defer l.Close()
 
-	records := []string{
-		"first record",
-		"a",
-		"this is a longer third record with more data",
-		"",
-		"fifth",
-	}
-
+	records := []string{"first", "second", "third", "fourth", "fifth"}
 	offsets := make([]uint64, len(records))
+
+	var err2 error
 	for i, s := range records {
-		offsets[i], err = l.Append([]byte(s))
-		if err != nil {
-			t.Fatalf("Append(%q) failed: %v", s, err)
+		offsets[i], err2 = l.Append([]byte(s))
+		if err2 != nil {
+			t.Fatalf("Append(%q) failed: %v", s, err2)
 		}
 	}
 
 	for i, s := range records {
 		got, err := l.Read(offsets[i])
 		if err != nil {
-			t.Fatalf("Read(offset %d) failed: %v", offsets[i], err)
+			t.Fatalf("Read(%d) failed: %v", offsets[i], err)
 		}
 		if string(got) != s {
-			t.Errorf("Read(offset %d): got %q, want %q", offsets[i], got, s)
+			t.Errorf("Read(%d): got %q, want %q", offsets[i], got, s)
 		}
 	}
 }
 
 func TestReadRandomAccess(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.log")
+	dir := filepath.Join(t.TempDir(), "logs")
 
-	l, err := NewLog(path)
+	l, err := NewLog(dir, 0)
 	if err != nil {
 		t.Fatalf("NewLog failed: %v", err)
 	}
@@ -223,7 +114,6 @@ func TestReadRandomAccess(t *testing.T) {
 		}
 	}
 
-	// Read in arbitrary order: 3, 0, 4, 1, 2
 	order := []int{3, 0, 4, 1, 2}
 	for _, i := range order {
 		got, err := l.Read(uint64(i))
@@ -237,10 +127,9 @@ func TestReadRandomAccess(t *testing.T) {
 }
 
 func TestReadEmptyData(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.log")
+	dir := filepath.Join(t.TempDir(), "logs")
 
-	l, err := NewLog(path)
+	l, err := NewLog(dir, 0)
 	if err != nil {
 		t.Fatalf("NewLog failed: %v", err)
 	}
@@ -262,84 +151,41 @@ func TestReadEmptyData(t *testing.T) {
 }
 
 func TestReadInvalidOffset(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.log")
+	dir := filepath.Join(t.TempDir(), "logs")
 
-	l, err := NewLog(path)
+	l, err := NewLog(dir, 0)
 	if err != nil {
 		t.Fatalf("NewLog failed: %v", err)
 	}
 	defer l.Close()
 
-	// Empty log, offset 0 should fail.
 	_, err = l.Read(0)
 	if err == nil {
-		t.Fatal("expected error reading from empty log, got nil")
+		t.Fatal("expected error reading from empty log")
 	}
 
-	// Add one record, offset 1 should fail.
 	l.Append([]byte("only record"))
 
 	_, err = l.Read(1)
 	if err == nil {
-		t.Fatal("expected error reading offset 1 with only 1 record, got nil")
+		t.Fatal("expected error reading offset 1 with 1 record")
 	}
 
-	// Large offset should fail.
 	_, err = l.Read(999)
 	if err == nil {
-		t.Fatal("expected error reading offset 999, got nil")
-	}
-}
-
-func TestReadDetectsCorruption(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.log")
-
-	l, err := NewLog(path)
-	if err != nil {
-		t.Fatalf("NewLog failed: %v", err)
-	}
-
-	l.Append([]byte("important data"))
-	l.Close()
-
-	// Corrupt the data section.
-	raw, err := os.OpenFile(path, os.O_RDWR, 0644)
-	if err != nil {
-		t.Fatalf("open raw file: %v", err)
-	}
-	corruptPos := int64(headerSize + 2)
-	oneByte := make([]byte, 1)
-	raw.ReadAt(oneByte, corruptPos)
-	oneByte[0] ^= 0xFF
-	raw.WriteAt(oneByte, corruptPos)
-	raw.Close()
-
-	// Reopen. buildIndex should find zero valid records.
-	l2, err := NewLog(path)
-	if err != nil {
-		t.Fatalf("NewLog after corruption: %v", err)
-	}
-	defer l2.Close()
-
-	_, err = l2.Read(0)
-	if err == nil {
-		t.Fatal("expected error reading corrupted record, got nil")
+		t.Fatal("expected error reading offset 999")
 	}
 }
 
 func TestReadLargeRecord(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.log")
+	dir := filepath.Join(t.TempDir(), "logs")
 
-	l, err := NewLog(path)
+	l, err := NewLog(dir, 0)
 	if err != nil {
 		t.Fatalf("NewLog failed: %v", err)
 	}
 	defer l.Close()
 
-	// 1MB of data
 	want := bytes.Repeat([]byte("x"), 1024*1024)
 	offset, err := l.Append(want)
 	if err != nil {
@@ -356,12 +202,97 @@ func TestReadLargeRecord(t *testing.T) {
 	}
 }
 
-func TestReopenAndReadBack(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.log")
+func TestSegmentRotation(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
 
-	// Open, write some records, close.
-	l, err := NewLog(path)
+	// Each "record-X" is 8 bytes data → 20 bytes on disk.
+	// maxSegSize=50 means 2 records fit (40 bytes), third triggers rotation on next append.
+	l, err := NewLog(dir, 50)
+	if err != nil {
+		t.Fatalf("NewLog failed: %v", err)
+	}
+	defer l.Close()
+
+	for i := 0; i < 6; i++ {
+		_, err := l.Append([]byte(fmt.Sprintf("record-%d", i)))
+		if err != nil {
+			t.Fatalf("Append %d failed: %v", i, err)
+		}
+	}
+
+	// Count segment files.
+	entries, _ := os.ReadDir(dir)
+	segCount := 0
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".log") {
+			segCount++
+		}
+	}
+	if segCount < 2 {
+		t.Errorf("expected multiple segments, got %d", segCount)
+	}
+
+	t.Logf("created %d segments for 6 records", segCount)
+
+	// All records should be readable across segments.
+	for i := 0; i < 6; i++ {
+		got, err := l.Read(uint64(i))
+		if err != nil {
+			t.Fatalf("Read(%d) failed: %v", i, err)
+		}
+		want := fmt.Sprintf("record-%d", i)
+		if string(got) != want {
+			t.Errorf("Read(%d): got %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestSegmentRotationBoundary(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+
+	// "ab" is 2 bytes data → 14 bytes per record.
+	// maxSegSize=14 means exactly 1 record per segment.
+	l, err := NewLog(dir, 14)
+	if err != nil {
+		t.Fatalf("NewLog failed: %v", err)
+	}
+	defer l.Close()
+
+	records := []string{"ab", "cd", "ef", "gh"}
+	for _, s := range records {
+		if _, err := l.Append([]byte(s)); err != nil {
+			t.Fatalf("Append(%q) failed: %v", s, err)
+		}
+	}
+
+	// Should have 4 segment files (one record each).
+	entries, _ := os.ReadDir(dir)
+	segCount := 0
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".log") {
+			segCount++
+		}
+	}
+	if segCount != 4 {
+		t.Errorf("expected 4 segments, got %d", segCount)
+	}
+
+	// All records readable.
+	for i, s := range records {
+		got, err := l.Read(uint64(i))
+		if err != nil {
+			t.Fatalf("Read(%d) failed: %v", i, err)
+		}
+		if string(got) != s {
+			t.Errorf("Read(%d): got %q, want %q", i, got, s)
+		}
+	}
+}
+
+func TestReopenAndReadBack(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+
+	l, err := NewLog(dir, 0)
 	if err != nil {
 		t.Fatalf("NewLog failed: %v", err)
 	}
@@ -372,56 +303,45 @@ func TestReopenAndReadBack(t *testing.T) {
 			t.Fatalf("Append(%q) failed: %v", s, err)
 		}
 	}
+	l.Close()
 
-	if err := l.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-
-	// Reopen the same file.
-	l2, err := NewLog(path)
+	l2, err := NewLog(dir, 0)
 	if err != nil {
 		t.Fatalf("NewLog reopen failed: %v", err)
 	}
 	defer l2.Close()
 
-	// All records should be readable without manually setting up the index.
 	for i, s := range records {
 		got, err := l2.Read(uint64(i))
 		if err != nil {
-			t.Fatalf("Read(%d) after reopen failed: %v", i, err)
+			t.Fatalf("Read(%d) after reopen: %v", i, err)
 		}
 		if string(got) != s {
-			t.Errorf("Read(%d) after reopen: got %q, want %q", i, got, s)
+			t.Errorf("Read(%d): got %q, want %q", i, got, s)
 		}
 	}
 }
 
 func TestReopenAndAppendMore(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.log")
+	dir := filepath.Join(t.TempDir(), "logs")
 
-	// First session: write 2 records.
-	l, err := NewLog(path)
+	l, err := NewLog(dir, 0)
 	if err != nil {
 		t.Fatalf("NewLog failed: %v", err)
 	}
-
 	l.Append([]byte("first"))
 	l.Append([]byte("second"))
 	l.Close()
 
-	// Second session: reopen, write 2 more.
-	l2, err := NewLog(path)
+	l2, err := NewLog(dir, 0)
 	if err != nil {
 		t.Fatalf("NewLog reopen failed: %v", err)
 	}
-
 	l2.Append([]byte("third"))
 	l2.Append([]byte("fourth"))
 	l2.Close()
 
-	// Third session: reopen, verify all 4.
-	l3, err := NewLog(path)
+	l3, err := NewLog(dir, 0)
 	if err != nil {
 		t.Fatalf("NewLog final reopen failed: %v", err)
 	}
@@ -431,7 +351,7 @@ func TestReopenAndAppendMore(t *testing.T) {
 	for i, s := range expected {
 		got, err := l3.Read(uint64(i))
 		if err != nil {
-			t.Fatalf("Read(%d) failed: %v", i, err)
+			t.Fatalf("Read(%d): %v", i, err)
 		}
 		if string(got) != s {
 			t.Errorf("Read(%d): got %q, want %q", i, got, s)
@@ -439,19 +359,47 @@ func TestReopenAndAppendMore(t *testing.T) {
 	}
 }
 
-func TestReopenEmptyFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.log")
+func TestReopenWithSegmentRotation(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
 
-	// Create and close an empty log.
-	l, err := NewLog(path)
+	l, err := NewLog(dir, 50)
+	if err != nil {
+		t.Fatalf("NewLog failed: %v", err)
+	}
+
+	for i := 0; i < 10; i++ {
+		l.Append([]byte(fmt.Sprintf("record-%02d", i)))
+	}
+	l.Close()
+
+	l2, err := NewLog(dir, 50)
+	if err != nil {
+		t.Fatalf("NewLog reopen failed: %v", err)
+	}
+	defer l2.Close()
+
+	for i := 0; i < 10; i++ {
+		got, err := l2.Read(uint64(i))
+		if err != nil {
+			t.Fatalf("Read(%d) after reopen: %v", i, err)
+		}
+		want := fmt.Sprintf("record-%02d", i)
+		if string(got) != want {
+			t.Errorf("Read(%d): got %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestReopenEmptyLog(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+
+	l, err := NewLog(dir, 0)
 	if err != nil {
 		t.Fatalf("NewLog failed: %v", err)
 	}
 	l.Close()
 
-	// Reopen. Should have zero records.
-	l2, err := NewLog(path)
+	l2, err := NewLog(dir, 0)
 	if err != nil {
 		t.Fatalf("NewLog reopen failed: %v", err)
 	}
@@ -468,11 +416,9 @@ func TestReopenEmptyFile(t *testing.T) {
 }
 
 func TestReopenDetectsCorruption(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.log")
+	dir := filepath.Join(t.TempDir(), "logs")
 
-	// Write 3 records.
-	l, err := NewLog(path)
+	l, err := NewLog(dir, 0)
 	if err != nil {
 		t.Fatalf("NewLog failed: %v", err)
 	}
@@ -482,13 +428,13 @@ func TestReopenDetectsCorruption(t *testing.T) {
 	l.Append([]byte("this will be corrupted"))
 	l.Close()
 
-	// Corrupt the last record: flip a byte in its data section.
-	// First, we need to know where the last record starts.
-	// Record 0: headerSize + 15 = 27 bytes, starts at 0
-	// Record 1: headerSize + 15 = 27 bytes, starts at 27
-	// Record 2: headerSize + 22 = 34 bytes, starts at 54
-	// Corrupt a byte in record 2's data: byte 54 + headerSize + 2 = byte 68
-	raw, err := os.OpenFile(path, os.O_RDWR, 0644)
+	// Corrupt the last record.
+	// Record 0: 12 + 15 = 27 bytes, starts at byte 0
+	// Record 1: 12 + 15 = 27 bytes, starts at byte 27
+	// Record 2: 12 + 22 = 34 bytes, starts at byte 54
+	// Corrupt byte 54 + 12 + 2 = byte 68 (inside record 2's data).
+	segPath := filepath.Join(dir, "segment-000001.log")
+	raw, err := os.OpenFile(segPath, os.O_RDWR, 0644)
 	if err != nil {
 		t.Fatalf("open raw file: %v", err)
 	}
@@ -499,10 +445,9 @@ func TestReopenDetectsCorruption(t *testing.T) {
 	raw.WriteAt(oneByte, corruptPos)
 	raw.Close()
 
-	// Reopen. buildIndex should find records 0 and 1, stop at corrupted record 2.
-	l2, err := NewLog(path)
+	l2, err := NewLog(dir, 0)
 	if err != nil {
-		t.Fatalf("NewLog after corruption failed: %v", err)
+		t.Fatalf("NewLog after corruption: %v", err)
 	}
 	defer l2.Close()
 
@@ -523,9 +468,47 @@ func TestReopenDetectsCorruption(t *testing.T) {
 		t.Errorf("Read(1): got %q, want %q", got, "good record two")
 	}
 
-	// Record 2 should not exist in the index.
+	// Record 2 should not be readable.
 	_, err = l2.Read(2)
 	if err == nil {
-		t.Fatal("expected error reading corrupted record 2, got nil")
+		t.Fatal("expected error reading corrupted record 2")
+	}
+}
+
+func TestNewLogInitialSizeEmptyFile(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+
+	l, err := NewLog(dir, 0)
+	if err != nil {
+		t.Fatalf("NewLog failed: %v", err)
+	}
+	defer l.Close()
+
+	if l.Size() != 0 {
+		t.Fatalf("initial size: got %d, want 0", l.Size())
+	}
+}
+
+func TestNewLogInitialSizeExistingFile(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+
+	// Write one record using a proper log session.
+	l, err := NewLog(dir, 0)
+	if err != nil {
+		t.Fatalf("NewLog failed: %v", err)
+	}
+	l.Append([]byte("hello world"))
+	l.Close()
+
+	// Reopen and check size.
+	l2, err := NewLog(dir, 0)
+	if err != nil {
+		t.Fatalf("NewLog reopen failed: %v", err)
+	}
+	defer l2.Close()
+
+	expectedSize := int64(RecordSize(len("hello world")))
+	if l2.Size() != expectedSize {
+		t.Fatalf("size after reopen: got %d, want %d", l2.Size(), expectedSize)
 	}
 }

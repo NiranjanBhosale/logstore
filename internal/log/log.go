@@ -7,59 +7,313 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 )
 
-// Log is a single-segment append-only log stored in one file.
+const (
+	defaultMaxSegSize = 10 * 1024 * 1024 // 10MB
+)
+
+// Segment holds metadata about one segment file.
+type Segment struct {
+	name  string  // filename
+	index []int64 // byte position of each record within this segment
+	size  int64   // total bytes written
+}
+
+// Log is an append-only log stored across multiple segment files.
 type Log struct {
 	mu sync.Mutex
 
-	file   *os.File
-	writer *bufio.Writer
-
-	// index maps logical record offsets to byte positions in the file.
-	index []int64
-
-	// size tracks how many bytes are currently stored in the file.
-	// This can also be called as the last byte tracked
-	size int64
+	dir        string
+	segments   []*os.File
+	segInfo    []Segment
+	current    *os.File
+	writer     *bufio.Writer
+	maxSegSize int64
+	numRecords uint64
 }
 
-// NewLog opens or creates a single-file append-only log at path.
-func NewLog(path string) (*Log, error) {
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("open log file %q: %w", path, err)
+// NewLog opens or creates a log in the given directory.
+func NewLog(dir string, maxSegSize int64) (*Log, error) {
+	if maxSegSize <= 0 {
+		maxSegSize = defaultMaxSegSize
+	}
+
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("create log directory %q: %w", dir, err)
 	}
 
 	l := &Log{
-		file:   file,
-		writer: bufio.NewWriter(file),
-		index:  make([]int64, 0),
+		dir:        dir,
+		segments:   make([]*os.File, 0),
+		segInfo:    make([]Segment, 0),
+		maxSegSize: maxSegSize,
+	}
+
+	if err := l.discoverSegments(); err != nil {
+		return nil, fmt.Errorf("discover segments: %w", err)
 	}
 
 	if err := l.buildIndex(); err != nil {
-		file.Close()
-		return nil, fmt.Errorf("build index for %q: %w", path, err)
+		l.closeAll()
+		return nil, fmt.Errorf("build index: %w", err)
 	}
 
-	// Seek to the end so the bufio.Writer appends after existing data.
-	if _, err := l.file.Seek(l.size, io.SeekStart); err != nil {
-		file.Close()
-		return nil, fmt.Errorf("seek to end: %w", err)
+	// If no segments exist, create the first one.
+	if len(l.segments) == 0 {
+		if err := l.newSegment(); err != nil {
+			return nil, fmt.Errorf("create first segment: %w", err)
+		}
+	} else {
+		// Point writer at the last segment, seeked to the end.
+		lastIdx := len(l.segments) - 1
+		l.current = l.segments[lastIdx]
+		lastSize := l.segInfo[lastIdx].size
+		if _, err := l.current.Seek(lastSize, io.SeekStart); err != nil {
+			l.closeAll()
+			return nil, fmt.Errorf("seek to end of last segment: %w", err)
+		}
+		l.writer = bufio.NewWriter(l.current)
 	}
 
 	return l, nil
 }
 
-// Size returns the current number of bytes in the log file.
+// segmentName returns the filename for a segment number (1-based).
+func (l *Log) segmentName(segNum int) string {
+	return filepath.Join(l.dir, fmt.Sprintf("segment-%06d.log", segNum))
+}
+
+// discoverSegments finds and opens all existing segment files.
+func (l *Log) discoverSegments() error {
+	entries, err := os.ReadDir(l.dir)
+	if err != nil {
+		return err
+	}
+
+	var names []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "segment-") && strings.HasSuffix(e.Name(), ".log") {
+			names = append(names, e.Name())
+		}
+	}
+
+	sort.Strings(names)
+
+	for _, name := range names {
+		numStr := strings.TrimSuffix(strings.TrimPrefix(name, "segment-"), ".log")
+		if _, err := strconv.Atoi(numStr); err != nil {
+			return fmt.Errorf("parse segment number from %q: %w", name, err)
+		}
+
+		path := filepath.Join(l.dir, name)
+		seg, err := os.OpenFile(path, os.O_RDWR, 0644)
+		if err != nil {
+			return fmt.Errorf("open segment %q: %w", name, err)
+		}
+
+		l.segments = append(l.segments, seg)
+		l.segInfo = append(l.segInfo, Segment{
+			name:  name,
+			index: make([]int64, 0),
+		})
+	}
+
+	return nil
+}
+
+// newSegment creates a new segment file and makes it the current one.
+func (l *Log) newSegment() error {
+	segNum := len(l.segments) + 1
+	name := l.segmentName(segNum)
+
+	seg, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return fmt.Errorf("create segment %d: %w", segNum, err)
+	}
+
+	l.segments = append(l.segments, seg)
+	l.segInfo = append(l.segInfo, Segment{
+		name:  filepath.Base(name),
+		index: make([]int64, 0),
+	})
+	l.current = seg
+	l.writer = bufio.NewWriter(seg)
+
+	return nil
+}
+
+// closeAll closes all open segment files.
+func (l *Log) closeAll() {
+	for _, seg := range l.segments {
+		if seg != nil {
+			seg.Close()
+		}
+	}
+}
+
+func (l *Log) buildIndex() error {
+	l.numRecords = 0
+
+	for segIdx, seg := range l.segments {
+		if _, err := seg.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("seek segment %d: %w", segIdx, err)
+		}
+
+		// Reset this segment's index.
+		l.segInfo[segIdx].index = make([]int64, 0)
+		var segSize int64
+
+		for {
+			bytePos := segSize
+
+			header := make([]byte, headerSize)
+			_, err := io.ReadFull(seg, header)
+
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break
+			}
+			if err != nil {
+				return fmt.Errorf("read header in segment %d at byte %d: %w",
+					segIdx, bytePos, err)
+			}
+
+			dataLen := binary.BigEndian.Uint64(header[0:lenSize])
+
+			data := make([]byte, dataLen)
+			if dataLen > 0 {
+				_, err = io.ReadFull(seg, data)
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					break
+				}
+				if err != nil {
+					return fmt.Errorf("read data in segment %d at byte %d: %w",
+						segIdx, bytePos, err)
+				}
+			}
+
+			storedChecksum := binary.BigEndian.Uint32(header[lenSize:headerSize])
+			if storedChecksum != crc32.ChecksumIEEE(data) {
+				break
+			}
+
+			l.segInfo[segIdx].index = append(l.segInfo[segIdx].index, bytePos)
+			segSize += int64(headerSize) + int64(dataLen)
+		}
+
+		l.segInfo[segIdx].size = segSize
+		l.numRecords += uint64(len(l.segInfo[segIdx].index))
+	}
+
+	return nil
+}
+
+func (l *Log) Append(data []byte) (uint64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Check if current segment needs rotation.
+	lastIdx := len(l.segments) - 1
+	if l.segInfo[lastIdx].size >= l.maxSegSize {
+		// Flush the current writer before switching segments.
+		if err := l.writer.Flush(); err != nil {
+			return 0, fmt.Errorf("flush before rotation: %w", err)
+		}
+		if err := l.newSegment(); err != nil {
+			return 0, fmt.Errorf("rotate segment: %w", err)
+		}
+		lastIdx += 1
+	}
+
+	record := Encode(data)
+	bytePos := l.segInfo[lastIdx].size
+
+	n, err := l.writer.Write(record)
+	if err != nil {
+		return 0, fmt.Errorf("append record: %w", err)
+	}
+
+	l.segInfo[lastIdx].index = append(l.segInfo[lastIdx].index, bytePos)
+	l.segInfo[lastIdx].size += int64(n)
+
+	offset := l.numRecords
+	l.numRecords++
+
+	return offset, nil
+}
+
+func (l *Log) Read(offset uint64) ([]byte, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if offset >= l.numRecords {
+		return nil, fmt.Errorf("offset %d out of range: log has %d records",
+			offset, l.numRecords)
+	}
+
+	if err := l.writer.Flush(); err != nil {
+		return nil, fmt.Errorf("flush before read: %w", err)
+	}
+
+	// Find which segment this offset belongs to.
+	segIdx, localOffset := l.locateRecord(offset)
+
+	seg := l.segments[segIdx]
+	info := l.segInfo[segIdx]
+	bytePos := info.index[localOffset]
+
+	// Figure out record size.
+	var recordSize int64
+	if int(localOffset+1) < len(info.index) {
+		// Not the last record in this segment.
+		recordSize = info.index[localOffset+1] - bytePos
+	} else {
+		// Last record in this segment.
+		recordSize = info.size - bytePos
+	}
+
+	// Seek and read.
+	if _, err := seg.Seek(bytePos, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek to offset %d: %w", offset, err)
+	}
+
+	record := make([]byte, recordSize)
+	if _, err := io.ReadFull(seg, record); err != nil {
+		return nil, fmt.Errorf("read record at offset %d: %w", offset, err)
+	}
+
+	return Decode(record)
+}
+
+// locateRecord maps a global offset to a segment index and local offset within that segment.
+func (l *Log) locateRecord(offset uint64) (segIdx int, localOffset uint64) {
+	remaining := offset
+	for i, info := range l.segInfo {
+		count := uint64(len(info.index))
+		if remaining < count {
+			return i, remaining
+		}
+		remaining -= count
+	}
+	// Should never reach here if offset was validated.
+	return 0, 0
+}
+
 func (l *Log) Size() int64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.size
+	var total int64
+	for _, info := range l.segInfo {
+		total += info.size
+	}
+	return total
 }
 
-// Close flushes buffered data and closes the underlying file.
 func (l *Log) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -70,126 +324,14 @@ func (l *Log) Close() error {
 		}
 	}
 
-	if l.file != nil {
-		if err := l.file.Close(); err != nil {
-			return fmt.Errorf("close file: %w", err)
+	var firstErr error
+	for _, seg := range l.segments {
+		if seg != nil {
+			if err := seg.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 
-	return nil
-}
-
-// Append writes data to the log and returns the offset assigned to this record.
-func (l *Log) Append(data []byte) (uint64, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	// The offset for this record is the current number of records.
-	// If we have 0 records, this new one gets offset 0.
-	// If we have 5 records, this new one gets offset 5.
-	offset := uint64(len(l.index))
-
-	record := Encode(data)
-	bytePos := l.size
-
-	n, err := l.writer.Write(record)
-	if err != nil {
-		return 0, fmt.Errorf("append record: %w", err)
-	}
-
-	l.index = append(l.index, bytePos)
-	l.size += int64(n)
-
-	return offset, nil
-}
-
-func (l *Log) Read(offset uint64) ([]byte, error) {
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	// Check if this offset exists.
-	if offset >= uint64(len(l.index)) {
-		return nil, fmt.Errorf("offset %d out of range: log has %d records",
-			offset, len(l.index))
-	}
-
-	if err := l.writer.Flush(); err != nil {
-		return nil, fmt.Errorf("flush before read: %w", err)
-	}
-
-	bytePos := l.index[offset]
-
-	if _, err := l.file.Seek(bytePos, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("seek to offset %d (byte %d): %w",
-			offset, bytePos, err)
-	}
-
-	// Figure out how many bytes this record occupies.
-	var size int64
-	if int(offset+1) < len(l.index) {
-		// Not the last record: ends where the next record begins.
-		size = l.index[offset+1] - bytePos
-	} else {
-		// Last record: ends at EOF.
-		size = l.size - bytePos
-	}
-
-	// Read the raw bytes.
-	record := make([]byte, size)
-	if _, err := io.ReadFull(l.file, record); err != nil {
-		return nil, fmt.Errorf("read record at offset %d: %w", offset, err)
-	}
-
-	// Decode handles header parsing, checksum validation, everything.
-	return Decode(record)
-
-}
-
-func (l *Log) buildIndex() error {
-	if _, err := l.file.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("seek to start: %w", err)
-	}
-
-	var pos int64
-
-	for {
-
-		header := make([]byte, headerSize)
-		_, err := io.ReadFull(l.file, header)
-
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			break
-		}
-
-		if err != nil {
-			return fmt.Errorf("read header at byte %d: %w", pos, err)
-		}
-
-		dataLen := binary.BigEndian.Uint64(header[0:lenSize])
-		data := make([]byte, dataLen)
-
-		_, err = io.ReadFull(l.file, data)
-
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			break
-		}
-
-		if err != nil {
-			return fmt.Errorf("read data at byte %d: %w", pos, err)
-		}
-
-		storedChecksum := binary.BigEndian.Uint32(header[lenSize:headerSize])
-		newChecksum := crc32.ChecksumIEEE(data)
-
-		if storedChecksum != newChecksum {
-			break
-		}
-
-		l.index = append(l.index, pos)
-		pos += int64(headerSize + dataLen)
-	}
-
-	l.size = pos
-	return nil
+	return firstErr
 }
