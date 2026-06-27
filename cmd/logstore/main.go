@@ -29,7 +29,7 @@ func main() {
 }
 
 func session1(dir string) {
-	l, err := logstore.NewLog(dir, 0)
+	l, err := logstore.NewLog(dir, 0, logstore.SyncConfig{Mode: logstore.SyncNone})
 	if err != nil {
 		log.Fatalf("create log: %v", err)
 	}
@@ -57,7 +57,7 @@ func session1(dir string) {
 }
 
 func session2(dir string) {
-	l, err := logstore.NewLog(dir, 0)
+	l, err := logstore.NewLog(dir, 0, logstore.SyncConfig{Mode: logstore.SyncNone})
 	if err != nil {
 		log.Fatalf("reopen log: %v", err)
 	}
@@ -79,7 +79,7 @@ func session2(dir string) {
 }
 
 func session3(dir string) {
-	l, err := logstore.NewLog(dir, 0)
+	l, err := logstore.NewLog(dir, 0, logstore.SyncConfig{Mode: logstore.SyncNone})
 	if err != nil {
 		log.Fatalf("reopen log: %v", err)
 	}
@@ -117,7 +117,7 @@ func rotationDemo() {
 	defer os.RemoveAll(dir)
 
 	// 50 bytes per segment forces frequent rotation.
-	l, err := logstore.NewLog(dir, 50)
+	l, err := logstore.NewLog(dir, 50, logstore.SyncConfig{Mode: logstore.SyncNone})
 	if err != nil {
 		log.Fatalf("create log: %v", err)
 	}
