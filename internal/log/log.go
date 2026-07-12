@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -36,10 +38,15 @@ type Log struct {
 	writer     *bufio.Writer
 	maxSegSize int64
 	numRecords uint64
+
+	syncCfg       SyncConfig
+	unflushedRecs int           // records written since last sync
+	stopChan      chan struct{} // signals the batch sync goroutine to stop
+	doneChan      chan struct{} // signals the batch sync goroutine has stopped
 }
 
 // NewLog opens or creates a log in the given directory.
-func NewLog(dir string, maxSegSize int64) (*Log, error) {
+func NewLog(dir string, maxSegSize int64, syncCfg SyncConfig) (*Log, error) {
 	if maxSegSize <= 0 {
 		maxSegSize = defaultMaxSegSize
 	}
@@ -53,6 +60,7 @@ func NewLog(dir string, maxSegSize int64) (*Log, error) {
 		segments:   make([]*os.File, 0),
 		segInfo:    make([]Segment, 0),
 		maxSegSize: maxSegSize,
+		syncCfg:    syncCfg,
 	}
 
 	if err := l.discoverSegments(); err != nil {
@@ -79,6 +87,13 @@ func NewLog(dir string, maxSegSize int64) (*Log, error) {
 			return nil, fmt.Errorf("seek to end of last segment: %w", err)
 		}
 		l.writer = bufio.NewWriter(l.current)
+	}
+
+	// Start the batch sync goroutine if needed.
+	if l.syncCfg.Mode == SyncBatched {
+		l.stopChan = make(chan struct{})
+		l.doneChan = make(chan struct{})
+		go l.batchSyncLoop()
 	}
 
 	return l, nil
@@ -165,7 +180,13 @@ func (l *Log) buildIndex() error {
 			return fmt.Errorf("seek segment %d: %w", segIdx, err)
 		}
 
-		// Reset this segment's index.
+		// Get file size so we can validate dataLen values.
+		fileInfo, err := seg.Stat()
+		if err != nil {
+			return fmt.Errorf("stat segment %d: %w", segIdx, err)
+		}
+		fileSize := fileInfo.Size()
+
 		l.segInfo[segIdx].index = make([]int64, 0)
 		var segSize int64
 
@@ -185,7 +206,14 @@ func (l *Log) buildIndex() error {
 
 			dataLen := binary.BigEndian.Uint64(header[0:lenSize])
 
-			data := make([]byte, dataLen)
+			// Sanity check: dataLen cannot exceed remaining bytes in the file.
+			remaining := fileSize - bytePos - int64(headerSize)
+
+			if dataLen > math.MaxInt32 || int64(dataLen) > remaining || int64(dataLen) < 0 {
+				break
+			}
+
+			data := make([]byte, int(dataLen))
 			if dataLen > 0 {
 				_, err = io.ReadFull(seg, data)
 				if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -206,6 +234,12 @@ func (l *Log) buildIndex() error {
 			segSize += int64(headerSize) + int64(dataLen)
 		}
 
+		if fileInfo.Size() > segSize {
+			if err := seg.Truncate(segSize); err != nil {
+				return fmt.Errorf("truncate segment %d: %w", segIdx, err)
+			}
+		}
+
 		l.segInfo[segIdx].size = segSize
 		l.numRecords += uint64(len(l.segInfo[segIdx].index))
 	}
@@ -220,14 +254,20 @@ func (l *Log) Append(data []byte) (uint64, error) {
 	// Check if current segment needs rotation.
 	lastIdx := len(l.segments) - 1
 	if l.segInfo[lastIdx].size >= l.maxSegSize {
-		// Flush the current writer before switching segments.
-		if err := l.writer.Flush(); err != nil {
-			return 0, fmt.Errorf("flush before rotation: %w", err)
+		// Flush and optionally sync the old segment before rotating.
+		if l.syncCfg.Mode == SyncBatched {
+			if err := l.sync(); err != nil {
+				return 0, fmt.Errorf("sync before rotation: %w", err)
+			}
+		} else {
+			if err := l.writer.Flush(); err != nil {
+				return 0, fmt.Errorf("flush before rotation: %w", err)
+			}
 		}
 		if err := l.newSegment(); err != nil {
 			return 0, fmt.Errorf("rotate segment: %w", err)
 		}
-		lastIdx += 1
+		lastIdx = len(l.segments) - 1
 	}
 
 	record := Encode(data)
@@ -243,6 +283,24 @@ func (l *Log) Append(data []byte) (uint64, error) {
 
 	offset := l.numRecords
 	l.numRecords++
+	l.unflushedRecs++
+
+	// Sync based on mode.
+	switch l.syncCfg.Mode {
+	case SyncPerWrite:
+		if err := l.sync(); err != nil {
+			return 0, fmt.Errorf("per-write sync: %w", err)
+		}
+	case SyncBatched:
+		if l.unflushedRecs >= l.syncCfg.BatchRecords {
+			if err := l.sync(); err != nil {
+				return 0, fmt.Errorf("batch sync: %w", err)
+			}
+		}
+		// Time-based sync is handled by batchSyncLoop.
+	case SyncNone:
+		// No sync. Data sits in bufio.Writer and OS page cache.
+	}
 
 	return offset, nil
 }
@@ -315,9 +373,16 @@ func (l *Log) Size() int64 {
 }
 
 func (l *Log) Close() error {
+	// Stop the batch sync goroutine if it's running.
+	if l.syncCfg.Mode == SyncBatched && l.stopChan != nil {
+		close(l.stopChan) // signal the goroutine to stop
+		<-l.doneChan      // wait for it to actually stop
+	}
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	// Final sync to push everything to disk.
 	if l.writer != nil {
 		if err := l.writer.Flush(); err != nil {
 			return fmt.Errorf("flush writer: %w", err)
@@ -334,4 +399,44 @@ func (l *Log) Close() error {
 	}
 
 	return firstErr
+}
+
+// sync flushes the bufio.Writer and then calls file.Sync() on the current segment.
+// Must be called with l.mu held.
+func (l *Log) sync() error {
+	if l.writer == nil || l.current == nil {
+		return nil
+	}
+
+	if err := l.writer.Flush(); err != nil {
+		return fmt.Errorf("flush writer: %w", err)
+	}
+
+	if err := l.current.Sync(); err != nil {
+		return fmt.Errorf("sync file: %w", err)
+	}
+
+	l.unflushedRecs = 0
+	return nil
+}
+
+// batchSyncLoop runs in a background goroutine and periodically syncs
+// based on the configured interval.
+func (l *Log) batchSyncLoop() {
+	ticker := time.NewTicker(l.syncCfg.BatchInterval)
+	defer ticker.Stop()
+	defer close(l.doneChan)
+
+	for {
+		select {
+		case <-ticker.C:
+			l.mu.Lock()
+			if l.unflushedRecs > 0 {
+				l.sync()
+			}
+			l.mu.Unlock()
+		case <-l.stopChan:
+			return
+		}
+	}
 }

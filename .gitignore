@@ -1,6 +1,7 @@
 # Compiled binary
 logstore_exe
 
+internal/log/logs/
 # Test binary, built with go test -c
 *.test
 
