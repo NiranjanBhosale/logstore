@@ -1,3 +1,9 @@
+// Package log implements a single-node append-only log store with
+// configurable durability and crash recovery.
+//
+// Records are stored in segment files with a fixed 12-byte header
+// containing the data length and a CRC32 checksum. The log supports
+// three sync modes: no sync, per-write fsync, and batched fsync.
 package log
 
 import (
@@ -21,6 +27,9 @@ const (
 	headerSize = lenSize + crcSize // 12 bytes
 )
 
+// Encode converts raw data into the on-disk record format.
+// The returned byte slice contains the 12-byte header followed by the data,
+// ready to be written directly to a segment file.
 func Encode(data []byte) []byte {
 
 	dataLen := uint64(len(data))
@@ -41,7 +50,7 @@ func Encode(data []byte) []byte {
 
 }
 
-// Decode extracts the data from a record byte slice and validates its checksum.
+// Decode extracts the data from a record byte slice and validates its CRC32 checksum.
 // It returns the data and any error encountered.
 //
 // Possible errors:

@@ -17,7 +17,8 @@ import (
 )
 
 const (
-	defaultMaxSegSize = 10 * 1024 * 1024 // 10MB
+	// defaultMaxSegSize is the default maximum segment file size (10 MB).
+	defaultMaxSegSize = 10 * 1024 * 1024
 )
 
 // Segment holds metadata about one segment file.
@@ -28,6 +29,11 @@ type Segment struct {
 }
 
 // Log is an append-only log stored across multiple segment files.
+// Records are identified by a global offset (a monotonically increasing uint64)
+// assigned at append time. The log manages segment rotation, configurable
+// durability via fsync modes, and crash recovery on startup.
+//
+// Log is safe for concurrent use by multiple goroutines.
 type Log struct {
 	mu sync.Mutex
 
@@ -46,6 +52,13 @@ type Log struct {
 }
 
 // NewLog opens or creates a log in the given directory.
+//
+// If the directory already contains segment files, NewLog scans them to rebuild
+// the in-memory index and truncates any corrupted or incomplete records at the
+// tail of each segment (crash recovery).
+//
+// maxSegSize controls when a new segment file is created. Use 0 for the default
+// of 10 MB. syncCfg controls the fsync durability mode.
 func NewLog(dir string, maxSegSize int64, syncCfg SyncConfig) (*Log, error) {
 	if maxSegSize <= 0 {
 		maxSegSize = defaultMaxSegSize
@@ -104,7 +117,7 @@ func (l *Log) segmentName(segNum int) string {
 	return filepath.Join(l.dir, fmt.Sprintf("segment-%06d.log", segNum))
 }
 
-// discoverSegments finds and opens all existing segment files.
+// discoverSegments finds and opens all existing segment files in sorted order.
 func (l *Log) discoverSegments() error {
 	entries, err := os.ReadDir(l.dir)
 	if err != nil {
@@ -163,7 +176,7 @@ func (l *Log) newSegment() error {
 	return nil
 }
 
-// closeAll closes all open segment files.
+// closeAll closes all open segment files. Used during error cleanup.
 func (l *Log) closeAll() {
 	for _, seg := range l.segments {
 		if seg != nil {
@@ -172,6 +185,9 @@ func (l *Log) closeAll() {
 	}
 }
 
+// buildIndex scans all segment files, validates each record's checksum,
+// and populates the per-segment in-memory index. Corrupted or incomplete
+// records at the tail of any segment are truncated.
 func (l *Log) buildIndex() error {
 	l.numRecords = 0
 
@@ -247,6 +263,11 @@ func (l *Log) buildIndex() error {
 	return nil
 }
 
+// Append writes data to the log and returns the global offset assigned to the record.
+// The offset can later be passed to Read to retrieve the data.
+//
+// If the current segment exceeds maxSegSize, a new segment is created automatically.
+// Depending on the configured SyncMode, Append may call file.Sync() before returning.
 func (l *Log) Append(data []byte) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -305,6 +326,8 @@ func (l *Log) Append(data []byte) (uint64, error) {
 	return offset, nil
 }
 
+// Read retrieves the data for the record at the given global offset.
+// It validates the CRC32 checksum and returns an error if the data is corrupted.
 func (l *Log) Read(offset uint64) ([]byte, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -362,6 +385,7 @@ func (l *Log) locateRecord(offset uint64) (segIdx int, localOffset uint64) {
 	return 0, 0
 }
 
+// Size returns the total number of bytes of valid data across all segments.
 func (l *Log) Size() int64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -372,6 +396,8 @@ func (l *Log) Size() int64 {
 	return total
 }
 
+// Close stops any background sync goroutine, flushes buffered data,
+// and closes all segment files.
 func (l *Log) Close() error {
 	// Stop the batch sync goroutine if it's running.
 	if l.syncCfg.Mode == SyncBatched && l.stopChan != nil {
