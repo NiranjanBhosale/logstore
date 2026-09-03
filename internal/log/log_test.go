@@ -762,6 +762,237 @@ func TestSyncNone(t *testing.T) {
 	}
 }
 
+// TestCloseSyncsWhenDurabilityWasPromised checks that Close reaches stable
+// storage rather than only flushing into the page cache.
+//
+// Flushing bufio.Writer survives the process exiting but not the machine
+// losing power, so in a mode that promised durability a clean Close could
+// still lose records it had already acknowledged. unflushedRecs reaching zero
+// is the observable proxy for sync() having run: a real power-cut test is not
+// something a unit test can perform.
+func TestCloseSyncsWhenDurabilityWasPromised(t *testing.T) {
+	t.Run("SyncBatched", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "logs")
+
+		// Thresholds high enough that neither the count nor the timer fires,
+		// so anything synced was synced by Close.
+		cfg := SyncConfig{
+			Mode:          SyncBatched,
+			BatchRecords:  1000,
+			BatchInterval: time.Hour,
+		}
+		l, err := NewLog(dir, 0, cfg)
+		if err != nil {
+			t.Fatalf("NewLog failed: %v", err)
+		}
+
+		for i := 0; i < 5; i++ {
+			if _, err := l.Append([]byte("durable")); err != nil {
+				t.Fatalf("Append %d failed: %v", i, err)
+			}
+		}
+		if l.unflushedRecs != 5 {
+			t.Fatalf("setup: unflushedRecs = %d, want 5", l.unflushedRecs)
+		}
+
+		if err := l.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+		if l.unflushedRecs != 0 {
+			t.Errorf("unflushedRecs = %d after Close, want 0; Close did not sync",
+				l.unflushedRecs)
+		}
+	})
+
+	t.Run("SyncNone", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "logs")
+
+		l, err := NewLog(dir, 0, SyncConfig{Mode: SyncNone})
+		if err != nil {
+			t.Fatalf("NewLog failed: %v", err)
+		}
+		for i := 0; i < 5; i++ {
+			if _, err := l.Append([]byte("not durable")); err != nil {
+				t.Fatalf("Append %d failed: %v", i, err)
+			}
+		}
+		if err := l.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+
+		// SyncNone promises nothing, so it must not pay for an fsync it never
+		// offered. Records still readable after reopen, just not power-safe.
+		if l.unflushedRecs == 0 {
+			t.Error("SyncNone synced on Close; it should only have flushed")
+		}
+	})
+}
+
+// TestCloseIsIdempotent guards a panic: Close used to close stopChan
+// unconditionally, so a second call closed an already-closed channel. That is
+// easy to reach when an explicit shutdown path runs alongside a deferred Close.
+func TestCloseIsIdempotent(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+
+	cfg := SyncConfig{
+		Mode:          SyncBatched,
+		BatchRecords:  10,
+		BatchInterval: 20 * time.Millisecond,
+	}
+	l, err := NewLog(dir, 0, cfg)
+	if err != nil {
+		t.Fatalf("NewLog failed: %v", err)
+	}
+	if _, err := l.Append([]byte("record")); err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
+
+	if err := l.Close(); err != nil {
+		t.Fatalf("first Close failed: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Errorf("second Close returned %v, want nil", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Errorf("third Close returned %v, want nil", err)
+	}
+}
+
+// TestCloseClosesEverySegment checks that Close does not leak descriptors. It
+// used to return as soon as the writer flush failed, before closing any file.
+func TestCloseClosesEverySegment(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+
+	// 40 byte segments hold two 20 byte records, so this spans four files.
+	l, err := NewLog(dir, 40, SyncConfig{Mode: SyncNone})
+	if err != nil {
+		t.Fatalf("NewLog failed: %v", err)
+	}
+	for i := 0; i < 8; i++ {
+		if _, err := l.Append([]byte(fmt.Sprintf("record-%d", i))); err != nil {
+			t.Fatalf("Append %d failed: %v", i, err)
+		}
+	}
+	if len(l.segments) < 2 {
+		t.Fatalf("setup: expected multiple segments, got %d", len(l.segments))
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Closing an already-closed *os.File reports ErrClosed, which is how we
+	// can tell Close got to every one of them.
+	for i, seg := range l.segments {
+		if err := seg.Close(); !errors.Is(err, os.ErrClosed) {
+			t.Errorf("segment %d was left open: second Close returned %v", i, err)
+		}
+	}
+}
+
+// TestRotationSyncsDirectory exercises rotation in the durability modes, where
+// creating a segment now also fsyncs the directory so the new file's name is
+// durable and not just its contents.
+func TestRotationSyncsDirectory(t *testing.T) {
+	modes := []struct {
+		name string
+		cfg  SyncConfig
+	}{
+		{"SyncPerWrite", SyncConfig{Mode: SyncPerWrite}},
+		{"SyncBatched", SyncConfig{
+			Mode:          SyncBatched,
+			BatchRecords:  2,
+			BatchInterval: 50 * time.Millisecond,
+		}},
+	}
+
+	for _, m := range modes {
+		t.Run(m.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "logs")
+
+			l, err := NewLog(dir, 40, m.cfg)
+			if err != nil {
+				t.Fatalf("NewLog failed: %v", err)
+			}
+			for i := 0; i < 8; i++ {
+				if _, err := l.Append([]byte(fmt.Sprintf("record-%d", i))); err != nil {
+					t.Fatalf("Append %d failed: %v", i, err)
+				}
+			}
+			if err := l.Close(); err != nil {
+				t.Fatalf("Close failed: %v", err)
+			}
+
+			l2, err := NewLog(dir, 40, SyncConfig{Mode: SyncNone})
+			if err != nil {
+				t.Fatalf("reopen failed: %v", err)
+			}
+			defer l2.Close()
+
+			for i := 0; i < 8; i++ {
+				got, err := l2.Read(uint64(i))
+				if err != nil {
+					t.Fatalf("Read(%d): %v", i, err)
+				}
+				want := fmt.Sprintf("record-%d", i)
+				if string(got) != want {
+					t.Errorf("Read(%d): got %q, want %q", i, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestBackgroundSyncFailureStopsWrites covers the fail-stop behaviour. The
+// batched sync goroutine used to discard the error from sync(), so a failing
+// disk went unreported and Append kept handing out offsets for records that
+// were never going to reach storage.
+func TestBackgroundSyncFailureStopsWrites(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+
+	cfg := SyncConfig{
+		Mode:          SyncBatched,
+		BatchRecords:  1000, // only the timer should fire
+		BatchInterval: 10 * time.Millisecond,
+	}
+	l, err := NewLog(dir, 0, cfg)
+	if err != nil {
+		t.Fatalf("NewLog failed: %v", err)
+	}
+
+	if _, err := l.Append([]byte("written before the disk went away")); err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
+
+	// Fault injection: close the segment's descriptor behind the log's back so
+	// the next flush fails the way a dying disk would.
+	l.mu.Lock()
+	l.current.Close()
+	l.mu.Unlock()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		l.mu.Lock()
+		recorded := l.syncErr
+		l.mu.Unlock()
+		if recorded != nil {
+			t.Logf("background sync reported: %v", recorded)
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background sync failed but nothing was recorded")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if _, err := l.Append([]byte("after")); err == nil {
+		t.Error("Append returned an offset after the log lost its durability guarantee")
+	}
+
+	if err := l.Close(); err == nil {
+		t.Error("Close did not surface the background sync failure")
+	}
+}
+
 func TestCrashRecoveryTruncatesIncompleteRecord(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "logs")
 
