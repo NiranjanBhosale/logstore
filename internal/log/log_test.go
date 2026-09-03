@@ -2,6 +2,7 @@ package log
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -123,6 +124,116 @@ func TestReadRandomAccess(t *testing.T) {
 		}
 		if string(got) != records[i] {
 			t.Errorf("Read(%d): got %q, want %q", i, got, records[i])
+		}
+	}
+}
+
+// TestReadThenAppendDoesNotCorrupt is a regression test.
+//
+// Read used to Seek the segment's file handle, which shares its cursor with
+// the bufio.Writer that Append writes through. A read left the cursor
+// mid-file, so the next flush overwrote records that were already committed.
+// No concurrency was needed to trigger it: a single goroutine appending,
+// reading once, then appending again was enough to lose data.
+func TestReadThenAppendDoesNotCorrupt(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+
+	l, err := NewLog(dir, 0, SyncConfig{Mode: SyncNone})
+	if err != nil {
+		t.Fatalf("NewLog failed: %v", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		if _, err := l.Append([]byte(fmt.Sprintf("record-%d", i))); err != nil {
+			t.Fatalf("Append %d failed: %v", i, err)
+		}
+	}
+
+	// The poison: a read in the middle of the write sequence.
+	if _, err := l.Read(0); err != nil {
+		t.Fatalf("Read(0) failed: %v", err)
+	}
+
+	for i := 5; i < 10; i++ {
+		if _, err := l.Append([]byte(fmt.Sprintf("record-%d", i))); err != nil {
+			t.Fatalf("Append %d failed: %v", i, err)
+		}
+	}
+	l.Close()
+
+	// The segment must hold all 10 records. Before the fix it held 6.
+	wantSize := int64(10 * RecordSize(len("record-0")))
+	info, err := os.Stat(filepath.Join(dir, "segment-000001.log"))
+	if err != nil {
+		t.Fatalf("stat segment: %v", err)
+	}
+	if info.Size() != wantSize {
+		t.Errorf("segment size: got %d, want %d", info.Size(), wantSize)
+	}
+
+	l2, err := NewLog(dir, 0, SyncConfig{Mode: SyncNone})
+	if err != nil {
+		t.Fatalf("NewLog reopen failed: %v", err)
+	}
+	defer l2.Close()
+
+	for i := 0; i < 10; i++ {
+		got, err := l2.Read(uint64(i))
+		if err != nil {
+			t.Fatalf("Read(%d) after reopen: %v", i, err)
+		}
+		want := fmt.Sprintf("record-%d", i)
+		if string(got) != want {
+			t.Errorf("Read(%d): got %q, want %q", i, got, want)
+		}
+	}
+}
+
+// TestInterleavedReadAppendAcrossSegments exercises the same hazard while
+// segment rotation is happening, so reads land on both the current segment
+// and older, fully written ones.
+func TestInterleavedReadAppendAcrossSegments(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+
+	// "record-NN" is 9 bytes -> 21 bytes on disk. 50 byte segments hold 2.
+	l, err := NewLog(dir, 50, SyncConfig{Mode: SyncNone})
+	if err != nil {
+		t.Fatalf("NewLog failed: %v", err)
+	}
+
+	const total = 20
+	for i := 0; i < total; i++ {
+		if _, err := l.Append([]byte(fmt.Sprintf("record-%02d", i))); err != nil {
+			t.Fatalf("Append %d failed: %v", i, err)
+		}
+		// Read back every record written so far, after every single append.
+		for j := 0; j <= i; j++ {
+			got, err := l.Read(uint64(j))
+			if err != nil {
+				t.Fatalf("Read(%d) after append %d: %v", j, i, err)
+			}
+			want := fmt.Sprintf("record-%02d", j)
+			if string(got) != want {
+				t.Fatalf("Read(%d) after append %d: got %q, want %q", j, i, got, want)
+			}
+		}
+	}
+	l.Close()
+
+	l2, err := NewLog(dir, 50, SyncConfig{Mode: SyncNone})
+	if err != nil {
+		t.Fatalf("NewLog reopen failed: %v", err)
+	}
+	defer l2.Close()
+
+	for i := 0; i < total; i++ {
+		got, err := l2.Read(uint64(i))
+		if err != nil {
+			t.Fatalf("Read(%d) after reopen: %v", i, err)
+		}
+		want := fmt.Sprintf("record-%02d", i)
+		if string(got) != want {
+			t.Errorf("Read(%d): got %q, want %q", i, got, want)
 		}
 	}
 }
@@ -824,6 +935,191 @@ func TestCrashRecoveryThenAppend(t *testing.T) {
 		}
 		if string(got) != s {
 			t.Errorf("Read(%d): got %q, want %q", i, got, s)
+		}
+	}
+}
+
+// corruptByte flips every bit of one byte at pos in the named segment.
+func corruptByte(t *testing.T, dir, segName string, pos int64) {
+	t.Helper()
+	f, err := os.OpenFile(filepath.Join(dir, segName), os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("open %s: %v", segName, err)
+	}
+	defer f.Close()
+
+	b := make([]byte, 1)
+	if _, err := f.ReadAt(b, pos); err != nil {
+		t.Fatalf("read %s at %d: %v", segName, pos, err)
+	}
+	b[0] ^= 0xFF
+	if _, err := f.WriteAt(b, pos); err != nil {
+		t.Fatalf("write %s at %d: %v", segName, pos, err)
+	}
+}
+
+// segmentSizes returns the on-disk size of every segment file, by name.
+func segmentSizes(t *testing.T, dir string) map[string]int64 {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	sizes := make(map[string]int64)
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".log") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			t.Fatalf("stat %s: %v", e.Name(), err)
+		}
+		sizes[e.Name()] = info.Size()
+	}
+	return sizes
+}
+
+// TestRecoveryRefusesMidLogCorruption covers the case where a segment is
+// damaged while later segments still hold valid records.
+//
+// Truncating the damaged segment would discard the records after the damage
+// and shift every record in the later segments down to a lower global offset,
+// silently, because offsets are derived by counting rather than stored. The
+// log must refuse to open instead.
+func TestRecoveryRefusesMidLogCorruption(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+
+	// "record-N" is 20 bytes on disk; 40 byte segments hold two records each.
+	l, err := NewLog(dir, 40, SyncConfig{Mode: SyncNone})
+	if err != nil {
+		t.Fatalf("NewLog failed: %v", err)
+	}
+	for i := 0; i < 8; i++ {
+		if _, err := l.Append([]byte(fmt.Sprintf("record-%d", i))); err != nil {
+			t.Fatalf("Append %d failed: %v", i, err)
+		}
+	}
+	l.Close()
+
+	// Damage global offset 2, the first record of the second segment.
+	// Offsets 4 through 7 live in later segments and are untouched.
+	corruptByte(t, dir, "segment-000002.log", int64(headerSize+2))
+
+	before := segmentSizes(t, dir)
+
+	l2, err := NewLog(dir, 40, SyncConfig{Mode: SyncNone})
+	if err == nil {
+		l2.Close()
+		t.Fatal("NewLog succeeded on mid-log corruption; expected it to refuse")
+	}
+	if !errors.Is(err, ErrCorrupt) {
+		t.Errorf("error does not wrap ErrCorrupt: %v", err)
+	}
+	t.Logf("refused with: %v", err)
+
+	// Refusing must not destroy anything: the operator may still want to
+	// inspect these files or copy the good segments off.
+	after := segmentSizes(t, dir)
+	if len(before) != len(after) {
+		t.Fatalf("segment count changed: before %d, after %d", len(before), len(after))
+	}
+	for name, want := range before {
+		if got := after[name]; got != want {
+			t.Errorf("%s was modified: %d bytes before, %d after", name, want, got)
+		}
+	}
+}
+
+// TestRecoveryTruncatesWhenNothingFollows checks the other half of the rule.
+// The same damage is safe to truncate when no valid records exist after it,
+// even though the damaged segment is not the last file in the directory.
+func TestRecoveryTruncatesWhenNothingFollows(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+
+	l, err := NewLog(dir, 40, SyncConfig{Mode: SyncNone})
+	if err != nil {
+		t.Fatalf("NewLog failed: %v", err)
+	}
+	for i := 0; i < 4; i++ {
+		if _, err := l.Append([]byte(fmt.Sprintf("record-%d", i))); err != nil {
+			t.Fatalf("Append %d failed: %v", i, err)
+		}
+	}
+	l.Close()
+
+	// An empty third segment, as a crash between rotation and the first write
+	// of the new segment would leave behind. It holds no records, so nothing
+	// follows the damage below.
+	empty, err := os.Create(filepath.Join(dir, "segment-000003.log"))
+	if err != nil {
+		t.Fatalf("create empty segment: %v", err)
+	}
+	empty.Close()
+
+	// Damage the second record of segment 2, i.e. the last record in the log.
+	corruptByte(t, dir, "segment-000002.log", int64(RecordSize(len("record-3"))+headerSize+2))
+
+	l2, err := NewLog(dir, 40, SyncConfig{Mode: SyncNone})
+	if err != nil {
+		t.Fatalf("NewLog should have recovered, got: %v", err)
+	}
+	defer l2.Close()
+
+	for i := 0; i < 3; i++ {
+		got, err := l2.Read(uint64(i))
+		if err != nil {
+			t.Fatalf("Read(%d): %v", i, err)
+		}
+		want := fmt.Sprintf("record-%d", i)
+		if string(got) != want {
+			t.Errorf("Read(%d): got %q, want %q", i, got, want)
+		}
+	}
+	if _, err := l2.Read(3); err == nil {
+		t.Error("expected offset 3 to be gone after truncation")
+	}
+}
+
+// TestRecoveryPreservesOffsetsAfterTailTruncation is the property that the
+// mid-log refusal exists to protect: a record's offset must name the same
+// record before and after a crash.
+func TestRecoveryPreservesOffsetsAfterTailTruncation(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+
+	l, err := NewLog(dir, 40, SyncConfig{Mode: SyncNone})
+	if err != nil {
+		t.Fatalf("NewLog failed: %v", err)
+	}
+	for i := 0; i < 8; i++ {
+		if _, err := l.Append([]byte(fmt.Sprintf("record-%d", i))); err != nil {
+			t.Fatalf("Append %d failed: %v", i, err)
+		}
+	}
+	l.Close()
+
+	// A partial write at the very end, the ordinary crash case.
+	f, err := os.OpenFile(filepath.Join(dir, "segment-000004.log"), os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		t.Fatalf("open last segment: %v", err)
+	}
+	f.Write([]byte{0x00, 0x00, 0x00, 0x00, 0x05})
+	f.Close()
+
+	l2, err := NewLog(dir, 40, SyncConfig{Mode: SyncNone})
+	if err != nil {
+		t.Fatalf("NewLog after crash: %v", err)
+	}
+	defer l2.Close()
+
+	// Every surviving offset must still name the record it named before.
+	for i := 0; i < 8; i++ {
+		got, err := l2.Read(uint64(i))
+		if err != nil {
+			t.Fatalf("Read(%d): %v", i, err)
+		}
+		want := fmt.Sprintf("record-%d", i)
+		if string(got) != want {
+			t.Errorf("offset %d changed meaning: got %q, want %q", i, got, want)
 		}
 	}
 }

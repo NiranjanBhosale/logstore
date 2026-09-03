@@ -3,6 +3,7 @@ package log
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -20,6 +21,13 @@ const (
 	// defaultMaxSegSize is the default maximum segment file size (10 MB).
 	defaultMaxSegSize = 10 * 1024 * 1024
 )
+
+// ErrCorrupt is returned by NewLog when a segment is damaged in a way that
+// cannot be repaired locally without silently changing the offsets of records
+// that survived. Callers can test for it with errors.Is. A log that fails this
+// way is left untouched on disk so it can be inspected or restored from a
+// replica.
+var ErrCorrupt = errors.New("log corrupted")
 
 // Segment holds metadata about one segment file.
 type Segment struct {
@@ -186,10 +194,23 @@ func (l *Log) closeAll() {
 }
 
 // buildIndex scans all segment files, validates each record's checksum,
-// and populates the per-segment in-memory index. Corrupted or incomplete
-// records at the tail of any segment are truncated.
+// and populates the per-segment in-memory index.
+//
+// A scan stops at the first record that is incomplete or fails its checksum,
+// because a record's length field is the only way to locate the record that
+// follows it: once a record is known to be damaged, its length can no longer
+// be trusted and every byte position after it is unknown.
+//
+// Bytes past the last valid record are discarded only when doing so cannot
+// change the offset of any surviving record. Otherwise buildIndex returns
+// ErrCorrupt and leaves the files untouched.
 func (l *Log) buildIndex() error {
 	l.numRecords = 0
+
+	// fileSizes[i] is the on-disk size of segment i. Where it exceeds the
+	// scanned size recorded in segInfo[i].size, that segment holds trailing
+	// bytes belonging to no whole, checksum-valid record.
+	fileSizes := make([]int64, len(l.segments))
 
 	for segIdx, seg := range l.segments {
 		if _, err := seg.Seek(0, io.SeekStart); err != nil {
@@ -202,6 +223,7 @@ func (l *Log) buildIndex() error {
 			return fmt.Errorf("stat segment %d: %w", segIdx, err)
 		}
 		fileSize := fileInfo.Size()
+		fileSizes[segIdx] = fileSize
 
 		l.segInfo[segIdx].index = make([]int64, 0)
 		var segSize int64
@@ -250,14 +272,41 @@ func (l *Log) buildIndex() error {
 			segSize += int64(headerSize) + int64(dataLen)
 		}
 
-		if fileInfo.Size() > segSize {
-			if err := seg.Truncate(segSize); err != nil {
-				return fmt.Errorf("truncate segment %d: %w", segIdx, err)
-			}
-		}
-
 		l.segInfo[segIdx].size = segSize
 		l.numRecords += uint64(len(l.segInfo[segIdx].index))
+	}
+
+	// Global offsets are not stored on disk. A record's offset is derived at
+	// startup by counting the records that precede it, so discarding records
+	// from the middle of the log does not leave a gap -- it shifts every
+	// surviving record after that point down to a lower offset. Code that
+	// recorded "offset 7" before a crash would then read a different record
+	// under that name, and nothing would report an error.
+	//
+	// Truncation is therefore safe if and only if no valid records exist after
+	// the truncation point. Damage at the tail satisfies this trivially, which
+	// is what makes ordinary crash recovery legitimate: an interrupted write
+	// has nothing after it to renumber. Damage anywhere else does not, so the
+	// log refuses to open rather than quietly serving a different history.
+	for segIdx := range l.segments {
+		if fileSizes[segIdx] <= l.segInfo[segIdx].size {
+			continue
+		}
+
+		var recordsAfter int
+		for j := segIdx + 1; j < len(l.segInfo); j++ {
+			recordsAfter += len(l.segInfo[j].index)
+		}
+
+		if recordsAfter > 0 {
+			return fmt.Errorf("%w: segment %q holds %d valid bytes but is %d bytes on disk, and %d valid records follow it in later segments; discarding the damaged tail would renumber them",
+				ErrCorrupt, l.segInfo[segIdx].name, l.segInfo[segIdx].size,
+				fileSizes[segIdx], recordsAfter)
+		}
+
+		if err := l.segments[segIdx].Truncate(l.segInfo[segIdx].size); err != nil {
+			return fmt.Errorf("truncate segment %d: %w", segIdx, err)
+		}
 	}
 
 	return nil
@@ -337,6 +386,8 @@ func (l *Log) Read(offset uint64) ([]byte, error) {
 			offset, l.numRecords)
 	}
 
+	// Buffered bytes are not in the file yet, so a recently appended record
+	// would not be visible to the read below without this.
 	if err := l.writer.Flush(); err != nil {
 		return nil, fmt.Errorf("flush before read: %w", err)
 	}
@@ -358,13 +409,13 @@ func (l *Log) Read(offset uint64) ([]byte, error) {
 		recordSize = info.size - bytePos
 	}
 
-	// Seek and read.
-	if _, err := seg.Seek(bytePos, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("seek to offset %d: %w", offset, err)
-	}
-
+	// ReadAt is a positional read (pread): it takes the offset as an argument
+	// and does not consult or modify the file's cursor. Seeking here instead
+	// would leave the cursor mid-file, and since bufio.Writer writes at the
+	// cursor, the next flush would overwrite live records. ReadAt is also
+	// safe for concurrent use, which a shared cursor never can be.
 	record := make([]byte, recordSize)
-	if _, err := io.ReadFull(seg, record); err != nil {
+	if _, err := seg.ReadAt(record, bytePos); err != nil {
 		return nil, fmt.Errorf("read record at offset %d: %w", offset, err)
 	}
 
