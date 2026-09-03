@@ -57,6 +57,17 @@ type Log struct {
 	unflushedRecs int           // records written since last sync
 	stopChan      chan struct{} // signals the batch sync goroutine to stop
 	doneChan      chan struct{} // signals the batch sync goroutine has stopped
+
+	// syncErr holds the first failure reported by the background sync
+	// goroutine. Once it is set the log can no longer honour its configured
+	// durability, so Append stops accepting writes rather than acknowledging
+	// records it cannot promise to have persisted. Close reports it too.
+	syncErr error
+
+	// closed makes Close idempotent. Without it a second Close would close an
+	// already-closed stopChan and panic, which is easy to hit when a shutdown
+	// path runs alongside a deferred Close.
+	closed bool
 }
 
 // NewLog opens or creates a log in the given directory.
@@ -163,6 +174,27 @@ func (l *Log) discoverSegments() error {
 	return nil
 }
 
+// syncDir forces the log directory's own contents to stable storage, making
+// the names of any newly created segment files durable.
+//
+// A file's data and the directory entry that names it are durable separately.
+// Calling Sync on a segment guarantees its bytes survive a crash; it says
+// nothing about whether the directory still lists the file afterwards. Without
+// this the bytes can survive while the name does not, leaving a segment that
+// exists on disk but cannot be found.
+func (l *Log) syncDir() error {
+	d, err := os.Open(l.dir)
+	if err != nil {
+		return fmt.Errorf("open log directory %q: %w", l.dir, err)
+	}
+	defer d.Close()
+
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("sync log directory %q: %w", l.dir, err)
+	}
+	return nil
+}
+
 // newSegment creates a new segment file and makes it the current one.
 func (l *Log) newSegment() error {
 	segNum := len(l.segments) + 1
@@ -171,6 +203,16 @@ func (l *Log) newSegment() error {
 	seg, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return fmt.Errorf("create segment %d: %w", segNum, err)
+	}
+
+	// SyncNone promises nothing about crash survival, so it does not pay for
+	// this. Every other mode must, or a crash just after rotation can lose a
+	// whole segment whose records were already acknowledged as durable.
+	if l.syncCfg.Mode != SyncNone {
+		if err := l.syncDir(); err != nil {
+			seg.Close()
+			return err
+		}
 	}
 
 	l.segments = append(l.segments, seg)
@@ -321,6 +363,13 @@ func (l *Log) Append(data []byte) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	// A background sync has already failed, so the configured durability can
+	// no longer be delivered. Refuse the write instead of returning an offset
+	// the log cannot stand behind.
+	if l.syncErr != nil {
+		return 0, l.syncErr
+	}
+
 	// Check if current segment needs rotation.
 	lastIdx := len(l.segments) - 1
 	if l.segInfo[lastIdx].size >= l.maxSegSize {
@@ -447,10 +496,26 @@ func (l *Log) Size() int64 {
 	return total
 }
 
-// Close stops any background sync goroutine, flushes buffered data,
-// and closes all segment files.
+// Close stops any background sync goroutine, flushes buffered data, forces it
+// to stable storage unless the log is configured for SyncNone, and closes all
+// segment files.
+//
+// Close reports every error it encounters, joined together, rather than
+// stopping at the first: a failed flush must not prevent the segment files
+// from being closed. Calling Close more than once is safe; calls after the
+// first do nothing and return nil.
 func (l *Log) Close() error {
-	// Stop the batch sync goroutine if it's running.
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return nil
+	}
+	l.closed = true
+	l.mu.Unlock()
+
+	// Signal the sync goroutine and wait for it before taking the lock below.
+	// It acquires mu on every tick, so waiting for it while holding mu would
+	// deadlock.
 	if l.syncCfg.Mode == SyncBatched && l.stopChan != nil {
 		close(l.stopChan) // signal the goroutine to stop
 		<-l.doneChan      // wait for it to actually stop
@@ -459,23 +524,37 @@ func (l *Log) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// Final sync to push everything to disk.
-	if l.writer != nil {
-		if err := l.writer.Flush(); err != nil {
-			return fmt.Errorf("flush writer: %w", err)
-		}
+	var errs []error
+
+	if l.syncErr != nil {
+		errs = append(errs, l.syncErr)
 	}
 
-	var firstErr error
+	// Flushing the writer only moves bytes into the OS page cache, which
+	// survives the process exiting but not the machine losing power. Any mode
+	// that promised durability has to reach stable storage here, or records it
+	// already acknowledged can still be lost by a clean shutdown.
+	if l.syncCfg.Mode == SyncNone {
+		if l.writer != nil {
+			if err := l.writer.Flush(); err != nil {
+				errs = append(errs, fmt.Errorf("flush writer: %w", err))
+			}
+		}
+	} else if err := l.sync(); err != nil {
+		errs = append(errs, fmt.Errorf("final sync: %w", err))
+	}
+
+	// Close every segment whatever happened above. Returning early here would
+	// leak a file descriptor for every segment in the log.
 	for _, seg := range l.segments {
 		if seg != nil {
-			if err := seg.Close(); err != nil && firstErr == nil {
-				firstErr = err
+			if err := seg.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("close segment: %w", err))
 			}
 		}
 	}
 
-	return firstErr
+	return errors.Join(errs...)
 }
 
 // sync flushes the bufio.Writer and then calls file.Sync() on the current segment.
@@ -508,8 +587,13 @@ func (l *Log) batchSyncLoop() {
 		select {
 		case <-ticker.C:
 			l.mu.Lock()
-			if l.unflushedRecs > 0 {
-				l.sync()
+			// Stop retrying once a sync has failed. The failure is recorded
+			// for Append and Close to report; hammering the same failing disk
+			// every tick would only bury the original cause.
+			if l.unflushedRecs > 0 && l.syncErr == nil {
+				if err := l.sync(); err != nil {
+					l.syncErr = fmt.Errorf("background sync: %w", err)
+				}
 			}
 			l.mu.Unlock()
 		case <-l.stopChan:
