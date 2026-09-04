@@ -50,42 +50,66 @@ func Encode(data []byte) []byte {
 
 }
 
-// Decode extracts the data from a record byte slice and validates its CRC32 checksum.
-// It returns the data and any error encountered.
+// Decode extracts the data from the record at the start of buf and validates
+// its CRC32 checksum. It returns the data, the total number of bytes that
+// record occupied in buf, and any error encountered.
+//
+// buf may be longer than the record. It may hold several records back to back,
+// or trailing bytes belonging to no record at all, as a buffer read off a
+// network connection generally does. Decode reads only the record at the front
+// and reports its size, so a caller holding a batch can walk it:
+//
+//	for len(buf) > 0 {
+//		data, n, err := Decode(buf)
+//		if err != nil {
+//			return err
+//		}
+//		use(data)
+//		buf = buf[n:]
+//	}
 //
 // Possible errors:
-//   - record shorter than the 12-byte header
-//   - record shorter than header claims (truncated data)
+//   - buf shorter than the 12-byte header
+//   - buf shorter than the header claims (truncated data)
 //   - checksum mismatch (corrupted data)
-func Decode(record []byte) ([]byte, error) {
+func Decode(buf []byte) ([]byte, int, error) {
 
 	// Check 1: Confirm we have enough data
-	if len(record) < headerSize {
-		return nil, fmt.Errorf("record too short for header: got %d bytes, need %d",
-			len(record), headerSize)
+	if len(buf) < headerSize {
+		return nil, 0, fmt.Errorf("record too short for header: got %d bytes, need %d",
+			len(buf), headerSize)
 	}
 
 	// Extract header fields
-	dataLen := binary.BigEndian.Uint64(record[0:lenSize])
-	storedChecksum := binary.BigEndian.Uint32(record[lenSize:headerSize])
+	dataLen := binary.BigEndian.Uint64(buf[0:lenSize])
+	storedChecksum := binary.BigEndian.Uint32(buf[lenSize:headerSize])
 
-	// Check 2: Confirm data is available
-	totalNeeded := headerSize + int(dataLen)
-	if len(record) < totalNeeded {
-		return nil, fmt.Errorf("record truncated: header says %d data bytes, but only %d available",
-			dataLen, len(record)-headerSize)
+	// Check 2: Confirm the data is available.
+	//
+	// dataLen comes from bytes that may be corrupt, so the comparison stays in
+	// uint64. Converting first, as int(dataLen), wraps negative for a length
+	// near the top of the range and would let the bounds check pass.
+	available := uint64(len(buf) - headerSize)
+	if dataLen > available {
+		return nil, 0, fmt.Errorf("record truncated: header says %d data bytes, but only %d available",
+			dataLen, available)
 	}
 
-	data := record[headerSize:]
+	// Bound the slice by the length the header declared. Taking buf[headerSize:]
+	// instead would fold any following record, or any trailing padding, into
+	// this record's data. The checksum would then fail and report corruption,
+	// pointing at the disk when the real fault is the caller's slice.
+	total := headerSize + int(dataLen)
+	data := buf[headerSize:total]
 
 	// Check 3: Verify data integrity
 	actualChecksum := crc32.ChecksumIEEE(data)
 	if storedChecksum != actualChecksum {
-		return nil, fmt.Errorf("checksum mismatch: stored 0x%08X, computed 0x%08X",
+		return nil, 0, fmt.Errorf("checksum mismatch: stored 0x%08X, computed 0x%08X",
 			storedChecksum, actualChecksum)
 	}
 
-	return data, nil
+	return data, total, nil
 
 }
 

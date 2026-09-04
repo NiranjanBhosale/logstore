@@ -468,7 +468,10 @@ func (l *Log) Read(offset uint64) ([]byte, error) {
 		return nil, fmt.Errorf("read record at offset %d: %w", offset, err)
 	}
 
-	return Decode(record)
+	// recordSize came from the index, so it already bounds the record exactly;
+	// the byte count Decode reports is not needed here.
+	data, _, err := Decode(record)
+	return data, err
 }
 
 // locateRecord maps a global offset to a segment index and local offset within that segment.
