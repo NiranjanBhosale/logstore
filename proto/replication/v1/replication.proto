@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package replication.v1;
+
+option go_package = "github.com/NiranjanBhosale/logstore/internal/replication/replicationpb";
+
+service Replication {
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+}
+
+message AppendEntriesRequest {
+  repeated bytes entries = 1;
+}
+
+message AppendEntriesResponse {
+  bool accepted = 1;
+}
