@@ -1,27 +1,53 @@
 // Command follower runs a single replication follower.
-//
-// It listens for AppendEntries calls and logs what arrives. It does not yet
-// store anything: wiring the follower to its own logstore is week 2.
 package main
 
 import (
+	"context"
 	"flag"
+	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/NiranjanBhosale/logstore/internal/replication"
 )
 
 func main() {
+	// main does nothing but decide that a failure is fatal. The work happens in
+	// run so that run's deferred cleanup executes before the process exits:
+	// os.Exit, which log.Fatal calls, does not run defers.
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() (err error) {
 	addr := flag.String("addr", ":50051", "address to listen on")
+	dir := flag.String("dir", "follower-data", "directory to store the follower's log")
 	flag.Parse()
 
-	f := &replication.Follower{}
+	// NotifyContext returns a context that is cancelled when one of these
+	// signals arrives: Ctrl-C sends SIGINT, and SIGTERM is what most process
+	// supervisors send. stop restores the default behaviour, so a second Ctrl-C
+	// kills the process outright if the graceful path ever hangs.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	// Serve blocks for as long as the server is healthy, so reaching the next
-	// line at all means something went wrong. main is the right place to give
-	// up: it owns the process, which is why log.Fatalf belongs here and not
-	// inside the replication package.
-	if err := f.Serve(*addr); err != nil {
-		log.Fatalf("follower: %v", err)
+	f, err := replication.NewFollower(*dir)
+	if err != nil {
+		return fmt.Errorf("create follower: %w", err)
 	}
+
+	// Close flushes the buffer and fsyncs, and either can fail. A bare
+	// defer f.Close() would throw that error away. Assigning to the named
+	// return reports it instead -- unless Serve already failed, in which case
+	// that error is the more informative one and should win.
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("close follower: %w", cerr)
+		}
+	}()
+
+	return f.Serve(ctx, *addr)
 }
