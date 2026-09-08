@@ -2,7 +2,6 @@ package replication
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"net"
 
@@ -47,19 +46,19 @@ func (f *Follower) AppendEntries(ctx context.Context, req *replicationpb.AppendE
 	return &replicationpb.AppendEntriesResponse{Accepted: true}, nil
 }
 
-// Serve listens on addr and handles AppendEntries calls until ctx is cancelled
-// or the server fails.
+// Serve handles AppendEntries calls on lis until ctx is cancelled or the
+// server fails. The caller owns lis and is responsible for creating it, which
+// lets a test bind 127.0.0.1:0 and read back the port the OS chose.
 //
 // Cancelling ctx begins a graceful shutdown: the server stops accepting new
 // calls, lets the handlers already running finish, and only then returns.
-func (f *Follower) Serve(ctx context.Context, addr string) error {
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("listen on %s: %w", addr, err)
-	}
-
+func (f *Follower) Serve(ctx context.Context, lis net.Listener) error {
 	srv := grpc.NewServer()
 	replicationpb.RegisterReplicationServer(srv, f)
+
+	// lis.Addr reports the address actually bound, so a caller that asked for
+	// port 0 learns which port the OS picked.
+	log.Printf("follower listening on %s", lis.Addr())
 
 	// Both waiting for cancellation and serving requests block forever, so one
 	// of them has to run on its own goroutine. The watcher goes here because
@@ -74,8 +73,6 @@ func (f *Follower) Serve(ctx context.Context, addr string) error {
 		// that the caller is never told about.
 		srv.GracefulStop()
 	}()
-
-	log.Printf("follower listening on %s", addr)
 
 	// Serve returns nil once GracefulStop has finished, so a clean shutdown is
 	// not reported as a failure.
