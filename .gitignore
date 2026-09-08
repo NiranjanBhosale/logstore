@@ -2,6 +2,8 @@
 logstore_exe
 
 internal/log/logs/
+follower-data
+primary-data
 # Test binary, built with go test -c
 *.test
 

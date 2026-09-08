@@ -1,30 +1,62 @@
-// Command primary sends one hardcoded entry to a follower and reports the
-// answer.
+// Command primary appends records to its own log and replicates each one to a
+// follower.
 //
-// It is a one-shot: it dials, sends, prints, exits. Fanning out to several
-// followers and holding connections open is week 3.
+// It sends a fixed number of records and exits. Fanning out to several
+// followers is week 3.
 package main
 
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/NiranjanBhosale/logstore/internal/replication"
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() (err error) {
 	peer := flag.String("peer", "localhost:50051", "follower address to send to")
+	dir := flag.String("dir", "primary-data", "directory to store the primary's log")
+	count := flag.Int("count", 10, "number of records to send")
 	flag.Parse()
 
-	// Background is the empty root context: no deadline, never cancelled.
-	// Request derives its own 5 second timeout from it. A real primary would
-	// pass something cancellable here so a shutdown could interrupt in-flight
-	// calls, but nothing can interrupt this program yet.
-	accepted, err := replication.Request(context.Background(), *peer)
+	// Unlike the follower, this program is not waiting to be shut down: it has
+	// a finite amount of work. The signal context is here so that Ctrl-C part
+	// way through a long run cancels the in-flight call and lets the deferred
+	// Close below flush and fsync, rather than killing the process mid-write.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	p, err := replication.NewPrimary(*dir, *peer)
 	if err != nil {
-		log.Fatalf("primary: %v", err)
+		return fmt.Errorf("create primary: %w", err)
 	}
 
-	log.Printf("follower %s replied accepted=%v", *peer, accepted)
+	// Close closes both the log and the connection, and either can fail. A bare
+	// defer p.Close() would discard that. Assigning to the named return reports
+	// it instead, unless the run already failed for a more informative reason.
+	defer func() {
+		if cerr := p.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("close primary: %w", cerr)
+		}
+	}()
+
+	for i := 0; i < *count; i++ {
+		data := fmt.Appendf(nil, "record-%d", i)
+		if err := p.Put(ctx, data); err != nil {
+			return fmt.Errorf("put record %d of %d: %w", i, *count, err)
+		}
+	}
+
+	log.Printf("replicated %d records to %s", *count, *peer)
+	return nil
 }
