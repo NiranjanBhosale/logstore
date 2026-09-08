@@ -604,3 +604,9 @@ func (l *Log) batchSyncLoop() {
 		}
 	}
 }
+
+func (l *Log) NumRecords() uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.numRecords
+}

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -49,5 +50,10 @@ func run() (err error) {
 		}
 	}()
 
-	return f.Serve(ctx, *addr)
+	lis, err := net.Listen("tcp", *addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", *addr, err)
+	}
+
+	return f.Serve(ctx, lis)
 }
