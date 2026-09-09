@@ -79,28 +79,45 @@ func (p *Primary) Put(ctx context.Context, data []byte) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	var (
-		accepted int
-		errs     []error
-	)
+	// The channel is buffered to hold every peer's result. That is not an
+	// optimisation: session 2 stops reading once a majority has answered, and
+	// on an unbuffered channel the goroutines still in flight would block
+	// forever trying to hand over a result nobody will take. One leaked
+	// goroutine per slow follower, on every write.
+	results := make(chan replicaResult, len(p.peers))
 
 	// One record per request for now. Entries is a list precisely so that a
 	// single round trip can carry a batch, which is worth doing once there is a
 	// measurement to justify it.
 	for _, peer := range p.peers {
-		resp, err := peer.client.AppendEntries(ctx, &replicationpb.AppendEntriesRequest{
-			Entries: [][]byte{data},
-		})
+		go func() {
+			resp, err := peer.client.AppendEntries(ctx, &replicationpb.AppendEntriesRequest{
+				Entries: [][]byte{data},
+			})
 
-		// A failed RPC returns a nil resp, so nothing below may touch it. The
-		// continue matters as much as recording the error: falling through
-		// would dereference that nil.
-		if err != nil {
-			errs = append(errs, fmt.Errorf("replicate to %s: %w", peer.addr, err))
-			continue
-		}
-		if !resp.GetAccepted() {
-			errs = append(errs, fmt.Errorf("follower %s rejected the entry", peer.addr))
+			// A failed RPC returns a nil resp, so nothing below may touch it.
+			switch {
+			case err != nil:
+				results <- replicaResult{err: fmt.Errorf("replicate to %s: %w", peer.addr, err)}
+			case !resp.GetAccepted():
+				results <- replicaResult{err: fmt.Errorf("follower %s rejected the entry", peer.addr)}
+			default:
+				results <- replicaResult{}
+			}
+		}()
+	}
+
+	var (
+		accepted int
+		errs     []error
+	)
+
+	// Every peer is still waited for, and every peer must still accept. Session
+	// 2 changes this loop to stop early once a majority has answered.
+	for range p.peers {
+		r := <-results
+		if r.err != nil {
+			errs = append(errs, r.err)
 			continue
 		}
 		accepted++
@@ -111,6 +128,12 @@ func (p *Primary) Put(ctx context.Context, data []byte) error {
 			accepted, len(p.peers), errors.Join(errs...))
 	}
 	return nil
+}
+
+// replicaResult is one follower's answer to a replication attempt. A nil err
+// means the follower accepted the entry.
+type replicaResult struct {
+	err error
 }
 
 // Close closes the log and every peer connection.
