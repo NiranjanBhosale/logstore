@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/NiranjanBhosale/logstore/internal/replication"
@@ -24,7 +25,7 @@ func main() {
 }
 
 func run() (err error) {
-	peer := flag.String("peer", "localhost:50051", "follower address to send to")
+	peers := flag.String("peers", "localhost:50051", "follower address to send to")
 	dir := flag.String("dir", "primary-data", "directory to store the primary's log")
 	count := flag.Int("count", 10, "number of records to send")
 	flag.Parse()
@@ -36,7 +37,7 @@ func run() (err error) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	p, err := replication.NewPrimary(*dir, *peer)
+	p, err := replication.NewPrimary(*dir, strings.Split(*peers, ","))
 	if err != nil {
 		return fmt.Errorf("create primary: %w", err)
 	}
@@ -57,6 +58,6 @@ func run() (err error) {
 		}
 	}
 
-	log.Printf("replicated %d records to %s", *count, *peer)
+	// log.Printf("replicated %d records to %s", *count, *peer)
 	return nil
 }

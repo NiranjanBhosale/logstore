@@ -112,7 +112,7 @@ func TestPutReplicatesToFollower(t *testing.T) {
 	defer shutdown()
 
 	primaryDir := t.TempDir()
-	p, err := NewPrimary(primaryDir, addr)
+	p, err := NewPrimary(primaryDir, []string{addr})
 	if err != nil {
 		t.Fatalf("NewPrimary: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestPutDivergesWhenFollowerUnreachable(t *testing.T) {
 	defer shutdown()
 
 	primaryDir := t.TempDir()
-	p, err := NewPrimary(primaryDir, addr)
+	p, err := NewPrimary(primaryDir, []string{addr})
 	if err != nil {
 		t.Fatalf("NewPrimary: %v", err)
 	}

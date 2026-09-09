@@ -55,5 +55,7 @@ func run() (err error) {
 		return fmt.Errorf("listen on %s: %w", *addr, err)
 	}
 
+	log.Printf("follower listening on %s", lis.Addr())
+
 	return f.Serve(ctx, lis)
 }
