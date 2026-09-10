@@ -58,6 +58,6 @@ func run() (err error) {
 		}
 	}
 
-	// log.Printf("replicated %d records to %s", *count, *peer)
+	log.Printf("replicated %d records to %s", *count, *peers)
 	return nil
 }

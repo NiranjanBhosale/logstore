@@ -80,8 +80,8 @@ func (p *Primary) Put(ctx context.Context, data []byte) error {
 	defer cancel()
 
 	// The channel is buffered to hold every peer's result. That is not an
-	// optimisation: session 2 stops reading once a majority has answered, and
-	// on an unbuffered channel the goroutines still in flight would block
+	// optimisation: the loop below stops reading once a majority has answered,
+	// and on an unbuffered channel the goroutines still in flight would block
 	// forever trying to hand over a result nobody will take. One leaked
 	// goroutine per slow follower, on every write.
 	results := make(chan replicaResult, len(p.peers))
@@ -107,27 +107,59 @@ func (p *Primary) Put(ctx context.Context, data []byte) error {
 		}()
 	}
 
+	needed := p.quorum()
+
 	var (
 		accepted int
 		errs     []error
 	)
 
-	// Every peer is still waited for, and every peer must still accept. Session
-	// 2 changes this loop to stop early once a majority has answered.
+	// Zero followers is a one-node cluster, where the primary's own append is
+	// already a majority. The loop below would return success anyway, but only
+	// by never running; saying so here keeps that from looking accidental.
 	for range p.peers {
 		r := <-results
 		if r.err != nil {
 			errs = append(errs, r.err)
 			continue
 		}
+
 		accepted++
+		if accepted >= needed {
+			// Return on the fastest majority rather than waiting for the
+			// slowest follower. The peers that have not answered yet are still
+			// mid-RPC, and the deferred cancel above fires as this returns, so
+			// their calls are cancelled.
+			//
+			// Their handlers do not check ctx, so a cancelled follower still
+			// finishes appending and only loses the reply. It therefore holds
+			// the record while the primary has no idea that it does. The
+			// prefix invariant survives, since the primary appended first and
+			// no follower can be ahead of it; what is lost is knowledge, not
+			// agreement. Closing that gap is what the position fields in
+			// week 4 are for.
+			return nil
+		}
 	}
 
-	if accepted < len(p.peers) {
-		return fmt.Errorf("replicated to %d of %d followers: %w",
-			accepted, len(p.peers), errors.Join(errs...))
-	}
-	return nil
+	return fmt.Errorf("replicated to %d of %d followers, needed %d: %w",
+		accepted, len(p.peers), needed, errors.Join(errs...))
+}
+
+// quorum returns the number of follower acknowledgements a write needs before
+// it is committed.
+//
+// The cluster is the followers plus the primary, and a majority of n nodes is
+// n/2+1. The primary has already appended locally by the time this is
+// consulted, so it contributes one of those acknowledgements itself and the
+// followers only have to supply the rest.
+//
+// The interesting row is two followers: a three node cluster still needs only
+// one follower acknowledgement, exactly like a two node cluster, but it can
+// now lose a follower and keep accepting writes. That is where replication
+// starts buying availability rather than costing it.
+func (p *Primary) quorum() int {
+	return (len(p.peers) + 1) / 2
 }
 
 // replicaResult is one follower's answer to a replication attempt. A nil err

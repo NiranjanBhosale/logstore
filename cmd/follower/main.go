@@ -55,7 +55,6 @@ func run() (err error) {
 		return fmt.Errorf("listen on %s: %w", *addr, err)
 	}
 
-	log.Printf("follower listening on %s", lis.Addr())
-
+	// Serve logs the bound address itself, so there is nothing to announce here.
 	return f.Serve(ctx, lis)
 }
